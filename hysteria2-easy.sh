@@ -331,3 +331,46 @@ EOF"
   ssh_exec "systemctl enable hysteria2"
   log_ok "Systemd service enabled"
 }
+
+# ─── ACME / TLS certificates ────────────────────────────────────────────────
+install_acme_sh() {
+  log_info "Installing acme.sh..."
+  # < /dev/null prevents acme.sh's interactive prompts
+  ssh_exec "curl https://get.acme.sh | sh -s email=admin@\${SERVER_IP}.nip.io < /dev/null"
+  log_ok "acme.sh installed"
+}
+
+issue_certificate() {
+  local domain="${SERVER_IP}.nip.io"
+  log_info "Issuing certificate for ${domain}..."
+
+  # Free port 80 for acme.sh standalone HTTP-01 challenge
+  ssh_exec "fuser -k 80/tcp 2>/dev/null || true"
+  sleep 1
+
+  # HTTP-01 standalone challenge — acme.sh starts its own server on port 80
+  ssh_exec "~/.acme.sh/acme.sh --issue -d ${domain} --standalone --httpport 80 --force"
+
+  # Install cert to Hysteria2 paths, with auto-reload on renewal
+  ssh_exec "~/.acme.sh/acme.sh --install-cert -d ${domain} \
+    --key-file '${CERT_DIR}/${domain}_ecc/${domain}.key' \
+    --fullchain-file '${CERT_DIR}/${domain}_ecc/fullchain.cer' \
+    --reloadcmd 'systemctl restart hysteria2'"
+
+  # Verify cert was created
+  local cert_path="${CERT_DIR}/${domain}_ecc/fullchain.cer"
+  ssh_exec "[[ -f ${cert_path} ]]" || {
+    log_error "Certificate not found: ${cert_path}"
+    exit 1
+  }
+  log_ok "Certificate issued for ${domain}"
+}
+
+get_cert_fingerprint() {
+  local domain="${SERVER_IP}.nip.io"
+  local cert="${CERT_DIR}/${domain}_ecc/fullchain.cer"
+  # OpenSSL output: "sha256 Fingerprint=BA:A2:..." (note the SPACE, not "sha256Fingerprint=")
+  # Extract the hex value after '=' and strip colons
+  ssh_exec "openssl x509 -in ${cert} -noout -fingerprint -sha256 | \
+    sed 's/.*sha256 Fingerprint=//' | tr -d ':'"
+}
