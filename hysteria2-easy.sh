@@ -231,3 +231,103 @@ check_root() {
     exit 1
   fi
 }
+
+# ─── Hysteria2 installation ──────────────────────────────────────────────────
+detect_arch() {
+  local arch
+  arch=$(ssh_exec "uname -m")
+  case "$arch" in
+    x86_64) echo "amd64" ;;
+    aarch64 | arm64) echo "arm64" ;;
+    *)
+      log_error "Unsupported architecture: $arch"
+      exit 1
+      ;;
+  esac
+}
+
+get_latest_hysteria_version() {
+  # Tag format: app/v2.x.y — must return the FULL tag for download URL
+  curl -s https://api.github.com/repos/${HYSTERIA_REPO}/releases/latest \
+    | grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)"/\1/'
+}
+
+install_hysteria_binary() {
+  local arch tag url status
+  arch=$(detect_arch)
+  tag=$(get_latest_hysteria_version)
+
+  # Tag format is: app/v2.x.y — use full tag in download URL
+  url="https://github.com/${HYSTERIA_REPO}/releases/download/${tag}/hysteria-linux-${arch}"
+
+  log_info "Installing Hysteria2 ${tag} (${arch})..."
+  ssh_exec "mkdir -p ${HYSTERIA_DIR}"
+
+  # Verify URL is reachable before downloading
+  status=$(ssh_exec "curl -o /dev/null -sw '%{http_code}' '${url}'")
+  if [[ "$status" != "200" ]]; then
+    log_error "Failed to download Hysteria2: HTTP ${status}"
+    log_error "URL: ${url}"
+    exit 1
+  fi
+
+  ssh_exec "curl -fSL '${url}' -o ${HYSTERIA_DIR}/hysteria && chmod +x ${HYSTERIA_DIR}/hysteria"
+
+  # Verify binary works
+  ssh_exec "${HYSTERIA_DIR}/hysteria --version"
+  log_ok "Hysteria2 binary installed"
+}
+
+# ─── Server configuration ────────────────────────────────────────────────────
+create_server_config() {
+  local domain yaml_password
+  domain="${SERVER_IP}.nip.io"
+  # Escape double quotes for YAML string value: " → \"
+  yaml_password="${AUTH_PASSWORD//\"/\\\"}"
+
+  log_info "Creating Hysteria2 config..."
+  # NOTE: Hysteria2 v2 YAML — 'listen' is at ROOT level (NOT under 'server:')
+  ssh_exec "cat > ${HYSTERIA_DIR}/config.yaml << EOF
+  listen: :${HYSTERIA_PORT}
+
+tls:
+  cert: ${CERT_DIR}/${domain}_ecc/fullchain.cer
+  key: ${CERT_DIR}/${domain}_ecc/${domain}.key
+
+auth:
+  type: password
+  password: \"${yaml_password}\"
+
+masquerade:
+  type: proxy
+  proxy:
+    url: https://www.bing.com
+    rewriteHost: true
+EOF"
+  log_ok "Config written to ${HYSTERIA_DIR}/config.yaml"
+}
+
+# ─── Systemd service ─────────────────────────────────────────────────────────
+setup_systemd() {
+  local svc="/etc/systemd/system/hysteria2.service"
+  log_info "Setting up systemd service..."
+  # NOTE: heredoc is unquoted so ${HYSTERIA_DIR} and ${HYSTERIA_PORT} expand on the remote
+  ssh_exec "cat > ${svc} << EOF
+[Unit]
+Description=Hysteria2 Server
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=${HYSTERIA_DIR}/hysteria server -c ${HYSTERIA_DIR}/config.yaml
+Restart=on-failure
+RestartSec=5s
+LimitNOFILE=65536
+
+[Install]
+WantedBy=multi-user.target
+EOF"
+  ssh_exec "systemctl daemon-reload"
+  ssh_exec "systemctl enable hysteria2"
+  log_ok "Systemd service enabled"
+}
