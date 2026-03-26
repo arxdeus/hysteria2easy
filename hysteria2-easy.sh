@@ -374,3 +374,121 @@ get_cert_fingerprint() {
   ssh_exec "openssl x509 -in ${cert} -noout -fingerprint -sha256 | \
     sed 's/.*sha256 Fingerprint=//' | tr -d ':'"
 }
+
+# ─── JSON / URI helpers ─────────────────────────────────────────────────────
+escape_json() {
+  # Escape special characters for JSON string embedding
+  local s="$1"
+  s="${s//\\/\\\\}"   # \ → \\
+  s="${s//\"/\\\"}"   # " → \"
+  s="${s//$'\n'/\\n}" # newline → \n
+  s="${s//$'\r'/\\r}" # carriage return → \r
+  s="${s//$'\t'/\\t}" # tab → \t
+  printf '%s' "$s"
+}
+
+generate_auth_json() {
+  local password="$1"
+  local escaped
+  escaped=$(escape_json "$password")
+  printf '{"auth_type":"password","password":"%s"}' "$escaped"
+}
+
+generate_uri() {
+  local auth_json auth_b64 fp domain uri
+  domain="${SERVER_IP}.nip.io"
+  auth_json=$(generate_auth_json "$AUTH_PASSWORD")
+  # base64url encoding (no padding, no newlines) — standard for hysteria2:// URIs
+  auth_b64=$(printf '%s' "$auth_json" | base64 | tr -d '=\n')
+  fp=$(get_cert_fingerprint)
+  # hysteria2:// URI:
+  #   sni — TLS Server Name Indication (required for TLS handshake)
+  #   insecure=0 — verify server certificate (recommended)
+  #   fp — certificate pin for additional security
+  #   remark — connection label
+  uri="hysteria2://${auth_b64}@${SERVER_IP}:${HYSTERIA_PORT}?sni=${domain}&insecure=0&fp=${fp}#${REMARK}"
+  echo "$uri"
+}
+
+# ─── Output ───────────────────────────────────────────────────────────────────
+show_qr() {
+  local uri="$1"
+  if command -v qrencode &>/dev/null; then
+    echo -e "\n${BOLD}QR Code — scan with Nekobox / v2rayN:${NC}"
+    qrencode -t ANSIUTF8 "$uri"
+  else
+    log_warn "qrencode not found. Install: sudo apt install qrencode"
+  fi
+}
+
+show_summary() {
+  local uri="$1"
+  local domain="${SERVER_IP}.nip.io"
+  cat <<EOF
+
+═════════════════════════════════════════════════════
+   Hysteria2 Server Setup Complete!
+═════════════════════════════════════════════════════
+  Server IP:    ${SERVER_IP}
+  Domain:       ${domain}
+  Port:         ${HYSTERIA_PORT}
+  Auth:         [hidden]
+
+  hysteria2:// URI:
+  ${uri}
+
+  ─── Server Commands ───────────────────────────────
+  Status:       systemctl status hysteria2
+  Logs:         journalctl -u hysteria2 -f --no-pager
+  Config:       ${HYSTERIA_DIR}/config.yaml
+  Cert:         ${CERT_DIR}/${domain}_ecc/
+═════════════════════════════════════════════════════
+
+EOF
+}
+
+start_hysteria() {
+  log_info "Starting Hysteria2..."
+  ssh_exec "systemctl restart hysteria2"
+  sleep 3
+
+  local status
+  status=$(ssh_exec "systemctl is-active hysteria2")
+  if [[ "$status" != "active" ]]; then
+    log_error "Hysteria2 failed to start."
+    log_info "Server logs:"
+    ssh_exec "journalctl -u hysteria2 -n 20 --no-pager"
+    exit 1
+  fi
+  log_ok "Hysteria2 is running"
+}
+
+# ─── Main ─────────────────────────────────────────────────────────────────────
+main() {
+  show_banner
+  parse_args "$@"
+  check_local_deps
+
+  prompt_ssh_config
+  ssh_test
+  check_remote_deps
+  check_root
+  prompt_server_config
+  check_ports
+
+  log_info "Server IP: ${SERVER_IP}"
+
+  install_hysteria_binary
+  install_acme_sh
+  issue_certificate
+  create_server_config
+  setup_systemd
+  start_hysteria
+
+  local uri
+  uri=$(generate_uri)
+  show_summary "$uri"
+  show_qr "$uri"
+}
+
+main "$@"
