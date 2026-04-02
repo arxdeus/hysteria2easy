@@ -12,6 +12,7 @@ CERT_DIR="/root/.acme.sh"
 # Default values (overridden by CLI args or prompts)
 SSH_HOST="" SSH_PORT="22" SSH_USER="root" SSH_PASSWORD=""
 SERVER_IP="" HYSTERIA_PORT="443" AUTH_PASSWORD="" REMARK="Hysteria2"
+SNI="web.max.ru"
 
 # ─── Color output ───────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -135,6 +136,10 @@ parse_args() {
         SERVER_IP="$2"
         shift 2
         ;;
+      --sni)
+        SNI="$2"
+        shift 2
+        ;;
       --help | -h)
         cat <<'HELPEOF'
 Usage: hysteria2easy.sh [OPTIONS]
@@ -147,6 +152,7 @@ Usage: hysteria2easy.sh [OPTIONS]
   --password PASS       Auth password [prompted]
   --remark REMARK       Connection remark [Hysteria2]
   --ip IP              Server public IP [auto-detected]
+  --sni SNI            SNI/hostname to masquerade as [web.max.ru]
   --help, -h           Show this help
 HELPEOF
         exit 0
@@ -308,7 +314,7 @@ auth:
 masquerade:
   type: proxy
   proxy:
-    url: https://www.bing.com
+    url: https://${SNI}
     rewriteHost: true
 EOF"
   log_ok "Config written to ${HYSTERIA_DIR}/config.yaml"

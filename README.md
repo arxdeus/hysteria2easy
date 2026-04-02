@@ -123,7 +123,7 @@ Running the script again on the same server is safe — it will:
 
 The script uses [nip.io](https://nip.io) for automatic DNS — `1.2.3.4.nip.io` resolves to `1.2.3.4`. This lets us get a real TLS certificate without owning a domain.
 
-Traffic masquerades as HTTPS to `bing.com`, making the connection look like normal web browsing.
+Traffic masquerades as HTTPS to `web.max.ru`, making the connection look like normal web browsing.
 
 ## License
 
