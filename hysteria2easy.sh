@@ -1,6 +1,8 @@
 #!/bin/bash
-# hysteria2-easy.sh — One-command Hysteria2 server setup with TLS + QR
-set -euo pipefail
+# hysteria2easy.sh — One-command Hysteria2 server setup with TLS + QR
+# Copyright (c) 2026 Artemis Kushner
+# https://github.com/arxdeus/hysteria2easy
+# Licensed under MIT
 
 VERSION="1.0.0"
 HYSTERIA_REPO="apernet/hysteria"
@@ -72,7 +74,11 @@ check_remote_deps() {
   # netcat-openbsd: nc command
   # psmisc: fuser command (kills processes on ports)
   # socat: needed for acme.sh HTTP-01 challenge
-  ssh_exec "apt-get update && apt-get install -y curl openssl socat net-tools psmisc netcat-openbsd"
+  # Use || true to allow error handling with set -e
+  ssh_exec "apt-get update && apt-get install -y curl openssl socat net-tools psmisc netcat-openbsd" || {
+    log_error "Failed to install remote dependencies"
+    exit 1
+  }
   # Verify all tools exist
   ssh_exec "command -v curl openssl socat nc fuser >/dev/null" || {
     log_error "One or more dependencies failed to install"
@@ -131,7 +137,7 @@ parse_args() {
         ;;
       --help | -h)
         cat <<'HELPEOF'
-Usage: hysteria2-easy.sh [OPTIONS]
+Usage: hysteria2easy.sh [OPTIONS]
 
   --ssh-host HOST       Server IP [required or prompted]
   --ssh-port PORT       SSH port [22]
@@ -171,22 +177,11 @@ prompt_ssh_config() {
 prompt_server_config() {
   echo -e "\n${BOLD}═══ Hysteria2 Configuration ═══${NC}"
 
-  # Auto-detect public IP from multiple sources
+  # Server IP = SSH_HOST (the IP we're already connected to)
   if [[ -z "$SERVER_IP" ]]; then
-    SERVER_IP=$(curl -s --max-time 5 ifconfig.me 2>/dev/null) \
-      || SERVER_IP=$(curl -s --max-time 5 ipinfo.io/ip 2>/dev/null) \
-      || SERVER_IP=""
+    SERVER_IP="$SSH_HOST"
   fi
-  if [[ -z "$SERVER_IP" ]]; then
-    read -p "Server public IP: " SERVER_IP
-  else
-    read -p "Server IP [${SERVER_IP}]: " tmp_ip
-    SERVER_IP="${tmp_ip:-$SERVER_IP}"
-  fi
-  [[ -z "$SERVER_IP" ]] && {
-    log_error "Server IP is required"
-    exit 1
-  }
+  log_info "Server IP: ${SERVER_IP}"
 
   [[ -z "$HYSTERIA_PORT" ]] && read -p "Hysteria2 Port [443]: " HYSTERIA_PORT
   HYSTERIA_PORT="${HYSTERIA_PORT:-443}"
@@ -207,16 +202,27 @@ prompt_server_config() {
 # ─── Pre-flight checks ────────────────────────────────────────────────────────
 check_ports() {
   log_info "Checking port availability..."
-  # netcat-openbsd uses separate flags -z -v -w3 (not -zvw3)
-  if ! ssh_exec "nc -zv -w3 localhost 80" &>/dev/null; then
-    log_error "Port 80 is not accessible on the server."
-    log_error "HTTP-01 ACME challenge requires port 80 to be open."
-    log_error "Fix: ufw allow 80 / iptables -A INPUT -p tcp --dport 80 -j ACCEPT"
-    exit 1
-  fi
-  log_ok "Port 80 is accessible"
 
-  if ssh_exec "nc -zv -w3 localhost ${HYSTERIA_PORT}" &>/dev/null; then
+  # Stop existing Hysteria2 if running (re-install scenario)
+  ssh_exec "systemctl stop hysteria2 2>/dev/null || true"
+  ssh_exec "fuser -k ${HYSTERIA_PORT}/tcp ${HYSTERIA_PORT}/udp 2>/dev/null || true"
+  sleep 2
+
+  # Port 80 must be FREE (not in use) — acme.sh will start its own listener
+  if ssh_exec "ss -tlnp | grep -q ':80 '" &>/dev/null; then
+    log_warn "Port 80 is occupied. Attempting to free it..."
+    ssh_exec "fuser -k 80/tcp 2>/dev/null || true"
+    sleep 1
+    if ssh_exec "ss -tlnp | grep -q ':80 '" &>/dev/null; then
+      log_error "Port 80 is still in use. acme.sh needs port 80 for HTTP-01 challenge."
+      log_error "Free it manually: fuser -k 80/tcp"
+      exit 1
+    fi
+  fi
+  log_ok "Port 80 is free for ACME challenge"
+
+  # Hysteria port must also be free
+  if ssh_exec "ss -tlnup | grep -q ':${HYSTERIA_PORT} '" &>/dev/null; then
     log_error "Port ${HYSTERIA_PORT} is already in use. Choose another port."
     exit 1
   fi
@@ -248,8 +254,9 @@ detect_arch() {
 
 get_latest_hysteria_version() {
   # Tag format: app/v2.x.y — must return the FULL tag for download URL
+  # [^"]* stops at the closing quote; trailing .* consumes the comma and rest of line
   curl -s https://api.github.com/repos/${HYSTERIA_REPO}/releases/latest \
-    | grep '"tag_name"' | sed 's/.*"tag_name": "\(.*\)"/\1/'
+    | grep '"tag_name"' | sed 's/.*"tag_name": "\([^"]*\)".*/\1/'
 }
 
 install_hysteria_binary() {
@@ -263,8 +270,8 @@ install_hysteria_binary() {
   log_info "Installing Hysteria2 ${tag} (${arch})..."
   ssh_exec "mkdir -p ${HYSTERIA_DIR}"
 
-  # Verify URL is reachable before downloading
-  status=$(ssh_exec "curl -o /dev/null -sw '%{http_code}' '${url}'")
+  # Verify URL is reachable before downloading (-L follows GitHub's 302 redirect to CDN)
+  status=$(ssh_exec "curl -o /dev/null -sLw '%{http_code}' '${url}'")
   if [[ "$status" != "200" ]]; then
     log_error "Failed to download Hysteria2: HTTP ${status}"
     log_error "URL: ${url}"
@@ -274,7 +281,7 @@ install_hysteria_binary() {
   ssh_exec "curl -fSL '${url}' -o ${HYSTERIA_DIR}/hysteria && chmod +x ${HYSTERIA_DIR}/hysteria"
 
   # Verify binary works
-  ssh_exec "${HYSTERIA_DIR}/hysteria --version"
+  ssh_exec "${HYSTERIA_DIR}/hysteria version"
   log_ok "Hysteria2 binary installed"
 }
 
@@ -288,7 +295,7 @@ create_server_config() {
   log_info "Creating Hysteria2 config..."
   # NOTE: Hysteria2 v2 YAML — 'listen' is at ROOT level (NOT under 'server:')
   ssh_exec "cat > ${HYSTERIA_DIR}/config.yaml << EOF
-  listen: :${HYSTERIA_PORT}
+listen: :${HYSTERIA_PORT}
 
 tls:
   cert: ${CERT_DIR}/${domain}_ecc/fullchain.cer
@@ -335,8 +342,14 @@ EOF"
 # ─── ACME / TLS certificates ────────────────────────────────────────────────
 install_acme_sh() {
   log_info "Installing acme.sh..."
-  # < /dev/null prevents acme.sh's interactive prompts
-  ssh_exec "curl https://get.acme.sh | sh -s email=admin@\${SERVER_IP}.nip.io < /dev/null"
+  # Download first, then run — avoids < /dev/null killing the pipe
+  ssh_exec "curl -fsSL https://get.acme.sh -o /tmp/install-acme.sh"
+  ssh_exec "sh /tmp/install-acme.sh email=admin@${SERVER_IP}.nip.io < /dev/null"
+  # Verify installation
+  ssh_exec "test -f ~/.acme.sh/acme.sh" || {
+    log_error "acme.sh installation failed — ~/.acme.sh/acme.sh not found"
+    exit 1
+  }
   log_ok "acme.sh installed"
 }
 
@@ -348,14 +361,19 @@ issue_certificate() {
   ssh_exec "fuser -k 80/tcp 2>/dev/null || true"
   sleep 1
 
+  # Use Let's Encrypt (ZeroSSL default requires EAB registration which often fails)
+  ssh_exec "~/.acme.sh/acme.sh --set-default-ca --server letsencrypt"
+
   # HTTP-01 standalone challenge — acme.sh starts its own server on port 80
   ssh_exec "~/.acme.sh/acme.sh --issue -d ${domain} --standalone --httpport 80 --force"
 
-  # Install cert to Hysteria2 paths, with auto-reload on renewal
+  # Install cert to Hysteria2 paths
+  # reloadcmd uses "|| true" because hysteria2 service may not exist yet during first setup;
+  # the reloadcmd matters for future automatic renewals
   ssh_exec "~/.acme.sh/acme.sh --install-cert -d ${domain} \
     --key-file '${CERT_DIR}/${domain}_ecc/${domain}.key' \
     --fullchain-file '${CERT_DIR}/${domain}_ecc/fullchain.cer' \
-    --reloadcmd 'systemctl restart hysteria2'"
+    --reloadcmd 'systemctl restart hysteria2 || true'"
 
   # Verify cert was created
   local cert_path="${CERT_DIR}/${domain}_ecc/fullchain.cer"
@@ -375,38 +393,15 @@ get_cert_fingerprint() {
     sed 's/.*sha256 Fingerprint=//' | tr -d ':'"
 }
 
-# ─── JSON / URI helpers ─────────────────────────────────────────────────────
-escape_json() {
-  # Escape special characters for JSON string embedding
-  local s="$1"
-  s="${s//\\/\\\\}"   # \ → \\
-  s="${s//\"/\\\"}"   # " → \"
-  s="${s//$'\n'/\\n}" # newline → \n
-  s="${s//$'\r'/\\r}" # carriage return → \r
-  s="${s//$'\t'/\\t}" # tab → \t
-  printf '%s' "$s"
-}
-
-generate_auth_json() {
-  local password="$1"
-  local escaped
-  escaped=$(escape_json "$password")
-  printf '{"auth_type":"password","password":"%s"}' "$escaped"
-}
-
+# ─── URI generation ──────────────────────────────────────────────────────────
 generate_uri() {
-  local auth_json auth_b64 fp domain uri
+  local fp domain uri encoded_pass
   domain="${SERVER_IP}.nip.io"
-  auth_json=$(generate_auth_json "$AUTH_PASSWORD")
-  # base64url encoding (no padding, no newlines) — standard for hysteria2:// URIs
-  auth_b64=$(printf '%s' "$auth_json" | base64 | tr -d '=\n')
   fp=$(get_cert_fingerprint)
-  # hysteria2:// URI:
-  #   sni — TLS Server Name Indication (required for TLS handshake)
-  #   insecure=0 — verify server certificate (recommended)
-  #   fp — certificate pin for additional security
-  #   remark — connection label
-  uri="hysteria2://${auth_b64}@${SERVER_IP}:${HYSTERIA_PORT}?sni=${domain}&insecure=0&fp=${fp}#${REMARK}"
+  # URL-encode only chars that break URI parsing: @ : # ? %
+  encoded_pass=$(printf '%s' "$AUTH_PASSWORD" | sed 's/%/%25/g; s/@/%40/g; s/:/%3A/g; s/#/%23/g; s/?/%3F/g')
+  # hysteria2:// URI format (note: /? not just ?)
+  uri="hysteria2://${encoded_pass}@${SERVER_IP}:${HYSTERIA_PORT}/?sni=${domain}&insecure=1&pinSHA256=${fp}#${REMARK}"
   echo "$uri"
 }
 
