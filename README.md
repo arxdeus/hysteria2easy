@@ -128,3 +128,43 @@ Traffic masquerades as HTTPS to `web.max.ru`, making the connection look like no
 ## License
 
 MIT — [Artemis Kushner](https://github.com/arxdeus) © 2026
+
+---
+
+## Alternative: VLESS + Reality (`vlessreality.sh`)
+
+Hysteria2 is UDP-only. In networks where UDP/QUIC is throttled or dropped
+(common under IP-whitelist filtering), it cannot work at all. `vlessreality.sh`
+deploys VLESS + Reality instead:
+
+```bash
+bash vlessreality.sh --ssh-host <IP> --dest www.microsoft.com
+```
+
+### Why it survives DPI
+
+| | Hysteria2 | VLESS + Reality |
+|---|---|---|
+| Transport | UDP/QUIC (blocked first) | **TCP/443** (looks like normal HTTPS) |
+| Certificate | own (self-signed / ACME) | **the real certificate of `--dest`** |
+| Own domain | needed for ACME | **not needed** |
+| Inbound TCP/80 | needed for ACME | **not needed** |
+| Active probing | reveals a proxy | forwards to the real site, indistinguishable |
+
+Reality terminates only authenticated clients; anyone else (including a
+censor's prober) is transparently proxied to `--dest`, so the server behaves
+exactly like a mirror of that site.
+
+### Choosing `--dest`
+
+Must support TLSv1.3, HTTP/2 and X25519, and must be **reachable from the
+client network** (a disguise pointing at a blocked site is itself a signal).
+The script validates all of this before writing the config.
+
+Good candidates: `www.microsoft.com`, `www.icloud.com`, `dl.google.com`,
+`www.samsung.com`. Prefer a site hosted in the same country as your server.
+
+### Clients
+
+v2rayNG, Nekobox, Streisand, Hiddify, sing-box, FoXray. Scan the QR code or
+paste the `vless://` URI. No `insecure` flag is needed.
