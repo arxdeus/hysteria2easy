@@ -152,7 +152,10 @@ Usage: olcrtceasy.sh [OPTIONS]
                         [datachannel]
   --jitsi-host HOST     Jitsi instance hostname (provider=jitsi).
                         Auto-picked from the repo's instance list if omitted.
-  --room ID             Room ID or full room URL. Auto-generated if omitted.
+  --room ID             Room ID or full room URL.
+                        jitsi: auto-generated if omitted.
+                        telemost/wbstream: REQUIRED — create the room in the
+                        web UI first (upstream cannot generate rooms).
   --key HEX             64-char hex encryption key. Generated if omitted.
   --dns ADDR:PORT       DNS used by the server [8.8.8.8:53]
   --wb-token TOKEN      WB Stream account token (needed for
@@ -170,6 +173,15 @@ Compatibility matrix (from upstream docs):
 
 RECOMMENDED: jitsi + datachannel (no registration, most stable).
 Alternative:  wbstream + vp8channel.
+
+Provider notes:
+  jitsi     no account, room generated automatically. Best default.
+  telemost  needs a Yandex account; create the meeting at
+            https://telemost.yandex.ru and pass its link via --room.
+            Requires --transport vp8channel. The tunnel dies when the
+            meeting is closed.
+  wbstream  create the room at https://stream.wb.ru and pass its ID via
+            --room. Use vp8channel unless you supply --wb-token.
 
 IMPORTANT: the chosen service must be whitelisted AND reachable in the
 CLIENT's network. Verify by opening the Jitsi host in a browser there.
@@ -226,6 +238,41 @@ validate_choices() {
 
   if [[ "$CRYPTO_KEY" != "" && ! "$CRYPTO_KEY" =~ ^[0-9a-fA-F]{64}$ ]]; then
     log_error "--key must be exactly 64 hex characters (openssl rand -hex 32)"
+    exit 1
+  fi
+
+  # telemost/wbstream have no working room generation upstream, so a missing
+  # --room is fatal. Check it here, before the multi-minute Go build, instead
+  # of after it.
+  if [[ "$PROVIDER" != "jitsi" && -z "$ROOM_ID" ]]; then
+    log_error "--room is required for provider '${PROVIDER}': it cannot auto-generate a room."
+    echo
+    case "$PROVIDER" in
+      telemost)
+        cat <<'ROOMEOF'
+  Create the meeting first (a Yandex account is required):
+    1. Open https://telemost.yandex.ru and create a meeting.
+    2. Copy its link, e.g. https://telemost.yandex.ru/j/12345678901234
+    3. Re-run with:
+         --provider telemost --transport vp8channel \
+           --room 'https://telemost.yandex.ru/j/12345678901234'
+
+  Note: telemost requires --transport vp8channel (DataChannel was removed),
+  and the tunnel lives only as long as the meeting stays open.
+ROOMEOF
+        ;;
+      wbstream)
+        cat <<'ROOMEOF'
+  Create the room first:
+    1. Open https://stream.wb.ru and create a stream/room.
+    2. Copy the room ID from its URL.
+    3. Re-run with:  --provider wbstream --transport vp8channel --room '<ROOM_ID>'
+ROOMEOF
+        ;;
+    esac
+    echo
+    log_info "Or use jitsi, which needs no account and generates the room automatically:"
+    log_info "  bash olcrtceasy.sh --ssh-host <IP> --provider jitsi --transport datachannel"
     exit 1
   fi
 
@@ -440,25 +487,39 @@ generate_room_and_key() {
     return 0
   fi
 
-  # telemost / wbstream: rooms are created by the provider, so use mode: gen
-  log_info "Generating a ${PROVIDER} room via olcRTC (mode: gen)..."
-  ssh_exec "cat > ${OLCRTC_DIR}/gen.yaml" <<REMOTEEOF || { log_error "Failed to write gen.yaml"; exit 1; }
-mode: gen
-auth:
-  provider: "${PROVIDER}"
-net:
-  dns: "${DNS_SERVER}"
-gen:
-  amount: 1
-REMOTEEOF
+  # telemost / wbstream cannot auto-generate a room. Upstream declares the
+  # auth.RoomCreator interface, but as of this writing NO provider implements
+  # CreateRoom, so `mode: gen` always fails with "does not support room
+  # generation". Ask the user for a room created through the web UI instead of
+  # burning a build on a guaranteed failure.
+  log_error "Provider '${PROVIDER}' cannot auto-generate a room (upstream has no CreateRoom implementation)."
+  echo
+  case "$PROVIDER" in
+    telemost)
+      cat <<'ROOMEOF'
+  Create the room manually, then pass it with --room:
+    1. Open https://telemost.yandex.ru and create a meeting
+       (a Yandex account is required).
+    2. Copy the meeting link, e.g.
+         https://telemost.yandex.ru/j/12345678901234
+    3. Re-run with:  --room 'https://telemost.yandex.ru/j/12345678901234'
 
-  ROOM_ID=$(ssh_exec "cd ${OLCRTC_DIR} && ./olcrtc gen.yaml" | tr -d '\r' | tail -1)
-  if [[ -z "$ROOM_ID" ]]; then
-    log_error "Room generation failed for provider ${PROVIDER}."
-    log_error "Create a room manually (telemost.yandex.ru / stream.wb.ru) and pass --room ID."
-    exit 1
-  fi
-  log_ok "Generated room: ${ROOM_ID}"
+  Keep the meeting alive: if the room is closed, the tunnel dies with it.
+ROOMEOF
+      ;;
+    wbstream)
+      cat <<'ROOMEOF'
+  Create the room manually, then pass it with --room:
+    1. Open https://stream.wb.ru and create a stream/room.
+    2. Copy the room ID from the URL.
+    3. Re-run with:  --room '<ROOM_ID>'
+ROOMEOF
+      ;;
+  esac
+  echo
+  log_info "Alternatively use jitsi, which needs no account and no manual room:"
+  log_info "  --provider jitsi --transport datachannel"
+  exit 1
 }
 
 # ─── Server configuration ────────────────────────────────────────────────────
