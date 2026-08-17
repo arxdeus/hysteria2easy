@@ -235,6 +235,54 @@ check_ports() {
   log_ok "Port ${HYSTERIA_PORT} is free"
 }
 
+# ─── Firewall ─────────────────────────────────────────────────────────────────
+# Hysteria2 speaks QUIC over UDP. When the server runs a default-deny
+# (whitelist) firewall, only SSH/TCP is usually allowed, so the client
+# silently fails to connect even though the service is "active".
+open_firewall() {
+  log_info "Opening firewall for UDP/${HYSTERIA_PORT} and TCP/80..."
+
+  # ufw (Ubuntu/Debian default)
+  if ssh_exec "command -v ufw >/dev/null && ufw status | grep -q '^Status: active'" &>/dev/null; then
+    ssh_exec "ufw allow ${HYSTERIA_PORT}/udp >/dev/null && ufw allow 80/tcp >/dev/null && ufw reload >/dev/null || true"
+    log_ok "ufw rules added (${HYSTERIA_PORT}/udp, 80/tcp)"
+  fi
+
+  # firewalld (RHEL family)
+  if ssh_exec "command -v firewall-cmd >/dev/null && firewall-cmd --state" &>/dev/null; then
+    ssh_exec "firewall-cmd --permanent --add-port=${HYSTERIA_PORT}/udp >/dev/null; firewall-cmd --permanent --add-port=80/tcp >/dev/null; firewall-cmd --reload >/dev/null || true"
+    log_ok "firewalld rules added (${HYSTERIA_PORT}/udp, 80/tcp)"
+  fi
+
+  # Raw iptables/nft default-deny INPUT policy
+  if ssh_exec "iptables -S INPUT 2>/dev/null | grep -qE '^-P INPUT (DROP|REJECT)'" &>/dev/null; then
+    ssh_exec "iptables -C INPUT -p udp --dport ${HYSTERIA_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${HYSTERIA_PORT} -j ACCEPT"
+    ssh_exec "iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 80 -j ACCEPT"
+    log_ok "iptables ACCEPT rules inserted (default-deny INPUT detected)"
+  fi
+
+  # Show what is actually filtering, for diagnosis
+  ssh_exec "iptables -S INPUT 2>/dev/null | head -20 || true"
+}
+
+# Verify UDP reachability from the client side after startup.
+verify_udp_reachable() {
+  log_info "Verifying UDP/${HYSTERIA_PORT} reachability from this machine..."
+  if ssh_exec "ss -lnup | grep -q ':${HYSTERIA_PORT} '" &>/dev/null; then
+    log_ok "Server is listening on UDP/${HYSTERIA_PORT}"
+  else
+    log_error "Server is NOT listening on UDP/${HYSTERIA_PORT} — check: journalctl -u hysteria2 -n 50"
+  fi
+
+  # A masquerade HTTPS probe over TCP will fail (Hysteria2 is UDP-only), so
+  # probe UDP directly; no reply is normal, ICMP unreachable means blocked.
+  if command -v nc &>/dev/null; then
+    printf 'x' | nc -u -w 2 "${SERVER_IP}" "${HYSTERIA_PORT}" &>/dev/null && \
+      log_ok "UDP packet sent to ${SERVER_IP}:${HYSTERIA_PORT} without ICMP rejection" || \
+      log_warn "UDP probe to ${SERVER_IP}:${HYSTERIA_PORT} was rejected — likely blocked by a cloud/provider firewall whitelist. Add an inbound rule for UDP ${HYSTERIA_PORT} in the provider panel."
+  fi
+}
+
 check_root() {
   local uid
   uid=$(ssh_exec "id -u")
@@ -476,6 +524,7 @@ main() {
   check_root
   prompt_server_config
   check_ports
+  open_firewall
 
   log_info "Server IP: ${SERVER_IP}"
 
@@ -485,6 +534,7 @@ main() {
   create_server_config
   setup_systemd
   start_hysteria
+  verify_udp_reachable
 
   local uri
   uri=$(generate_uri)
