@@ -155,32 +155,51 @@ Reality terminates only authenticated clients; anyone else (including a
 censor's prober) is transparently proxied to `--dest`, so the server behaves
 exactly like a mirror of that site.
 
+### Under RU whitelist filtering, read this first
+
+The Russian TSPU whitelist mode ("белые списки") filters on **two layers**
+([measurements](https://habr.com/ru/articles/1027276/),
+[data](https://github.com/openlibrecommunity/twl)):
+
+- **L3:** packets to any IP outside the allowed CIDR list are dropped silently.
+  ~63k IPs out of 46M Russian addresses pass, i.e. **0.14%**.
+- **L7:** for allowed IPs, the SNI in the ClientHello is inspected;
+  blacklisted SNI values get an RST.
+- **Ports:** only TCP **80 / 443 / 22** pass. Nearly all UDP is dropped —
+  QUIC, WireGuard, and external DNS (UDP:53) included.
+
+Two consequences that override any configuration tuning:
+
+1. **A foreign VPS cannot work at all.** Hetzner, DigitalOcean, Oracle: the IP
+   is not in the whitelist, so packets never leave the operator's network.
+   The server must sit on a whitelisted Russian IP — Yandex.Cloud (which alone
+   holds ~1/5 of all whitelisted addresses), Timeweb, VK Cloud, Selectel,
+   Beget, REG.RU.
+2. **Hysteria2 cannot work at all**, being UDP-only. Neither obfuscation nor
+   port hopping helps: the drop happens before DPI ever runs.
+
 ### Choosing `--dest`
 
-This is the single most important decision, and the popular tutorial answers
-(`www.microsoft.com`, `www.icloud.com`) are among the weakest.
+The requirement is not "a popular site" but **"a domain whose SNI is
+explicitly allowed"**. Test the built-in candidates against your server:
 
-Reality hides the *content* of your traffic, but not the relationship between
-the SNI you claim and the IP you send it to. A connection announcing
-`SNI=www.microsoft.com` toward a random VPS in another country is an anomaly
-detectable **passively, from a single packet** — no active probing required.
+```bash
+bash vlessreality.sh --ssh-host <IP> --scan-dest
+```
 
-Strength, best to worst:
+Known-good whitelisted SNI: `yastatic.net`, `storage.yandex.net`,
+`userapi.com`, `vkuser.net`, `vkuservideo.ru`, `cdnvideo.ru`, `okcdn.ru`,
+`hosting.reg.ru`.
 
-1. **A real site in your server's own subnet.** The SNI then matches the
-   network that owns your IP, so the pairing looks natural. Discover them:
-   ```bash
-   bash vlessreality.sh --ssh-host <IP> --scan-dest
-   ```
-2. A site hosted in the same **country** as your server.
-3. A widely-contacted CDN/software endpoint that is essentially never blocked
-   (`cdn.jsdelivr.net`, `swcdn.apple.com`, `dl.google.com`) — the default.
-4. **Avoid:** the most-copied tutorial dests, and anything blocked in the
-   *client's* network (a disguise pointing at a blocked site is itself a flag).
+**Never** use `twitter.com`, `x.com`, `youtube.com` or `telegram.org` — those
+SNI values are actively checked and reset. The script refuses them outright.
 
-Requirements, all checked automatically before the config is written:
-TLSv1.3, HTTP/2, X25519, no redirect away from the hostname, low RTT from the
-server (the handshake is really forwarded, so dest latency is added to yours).
+Whitelists differ per operator, region, and even per cell tower, and they
+change weekly. If one dest stops working for your clients, try the next.
+
+`fp=chrome` is included in the generated URI and is mandatory: the ordinary
+TSPU still fingerprints TLS on top of the whitelist layer, so Reality without
+a browser fingerprint is detectable.
 
 ### Clients
 

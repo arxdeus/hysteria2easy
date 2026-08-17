@@ -17,17 +17,37 @@ XRAY_DIR="/usr/local/xray"
 # Default values (overridden by CLI args or prompts)
 SSH_HOST="" SSH_PORT="22" SSH_USER="root" SSH_PASSWORD=""
 SERVER_IP="" VLESS_PORT="443" REMARK="VLESS-Reality"
-# The site whose TLS handshake we borrow. MUST support TLSv1.3 + HTTP/2 and
-# should be a host that is not blocked in the client's network.
+# The site whose TLS handshake we borrow.
 #
-# There is no universally good default: the strongest dest is one hosted NEAR
-# your server (same datacenter/subnet), so that the SNI matches the IP's owner.
-# Use --scan-dest to discover those. This default is only a reasonable
-# starting point: a CDN-hosted software endpoint, which is rarely blocked and
-# plausibly contacted by any machine (OS/software updates).
-DEST="cdn.jsdelivr.net"
+# Under Russian TSPU whitelist filtering ("белые списки") the requirement is
+# NOT "a popular site" but "a domain whose SNI is explicitly allowed". The
+# filter is two-layer: L3 drops packets to any IP outside the allowed CIDRs,
+# then L7 inspects the SNI in the ClientHello. So the dest must be a
+# whitelisted Russian CDN domain, and the SERVER ITSELF must sit on a
+# whitelisted Russian IP — a foreign VPS is unreachable at L3 no matter how
+# good the disguise.
+#
+# Default: a Yandex CDN host. Yandex.Cloud holds ~1/5 of all whitelisted IPs
+# and its CDN domains are allowed by every operator.
+# Source: openlibrecommunity/twl scan of TSPU whitelists.
+DEST="yastatic.net"
 UUID="" PRIVATE_KEY="" PUBLIC_KEY="" SHORT_ID=""
 SCAN_DEST=0
+
+# Known-good whitelisted SNI candidates (Yandex / VK / RU CDN + hosting).
+WHITELIST_SNI=(
+  "yastatic.net"        # Yandex static CDN
+  "storage.yandex.net"  # Yandex Object Storage
+  "userapi.com"         # VK API CDN
+  "vkuser.net"          # VK user content CDN
+  "vkuservideo.ru"      # VK video CDN
+  "cdnvideo.ru"         # CDNvideo
+  "okcdn.ru"            # OK CDN
+  "hosting.reg.ru"      # REG.RU hosting
+)
+
+# SNI values that are actively checked and RST'd — never use these.
+DANGEROUS_SNI="twitter.com x.com youtube.com telegram.org discord.com instagram.com facebook.com"
 
 # ─── Color output ───────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -133,8 +153,9 @@ Usage: vlessreality.sh [OPTIONS]
   --ssh-password PASS   SSH password [prompted]
   --port PORT           VLESS listening port [443]
   --dest HOST           Site to borrow the TLS handshake from
-                        [cdn.jsdelivr.net]. Must support TLSv1.3 + HTTP/2
-                        and must NOT be blocked in your network.
+                        [yastatic.net]. Under RU whitelist filtering this MUST
+                        be a whitelisted domain (Yandex/VK/RU CDN), not just
+                        any popular site.
   --scan-dest           Scan the server's own /24 for TLSv1.3 hosts and print
                         candidates, then exit. A dest in your server's subnet
                         makes the SNI/IP pairing look natural to passive DPI.
@@ -143,15 +164,28 @@ Usage: vlessreality.sh [OPTIONS]
   --ip IP               Server public IP [defaults to --ssh-host]
   --help, -h            Show this help
 
-Choosing --dest, in order of strength:
-  1. BEST: a real site hosted in your server's own subnet (use --scan-dest).
-     The SNI then matches the network that owns your IP.
-  2. GOOD: a site hosted in the same COUNTRY as your server.
-  3. OK:   a widely-contacted CDN/software endpoint that is never blocked,
-           e.g. cdn.jsdelivr.net, swcdn.apple.com, dl.google.com
-  4. AVOID: the most-copied tutorial dests (www.microsoft.com, www.icloud.com)
-     and any site blocked in the CLIENT's network.
-Requirements: TLSv1.3, HTTP/2, X25519, no redirect away, low RTT from server.
+IMPORTANT — how RU whitelist ("белые списки") filtering works:
+  L3: packets to any IP outside the allowed CIDR list are DROPPED silently.
+  L7: for allowed IPs, the SNI in the ClientHello is inspected; blacklisted
+      SNI values get an RST.
+  Ports: only TCP 80, 443 and 22 pass. Nearly all UDP is dropped, which is
+      why QUIC/WireGuard/Hysteria2 and external DNS (UDP:53) do not work.
+
+Consequences for this script:
+  * The SERVER must have a whitelisted Russian IP. A foreign VPS (Hetzner,
+    DigitalOcean, ...) is unreachable at L3 regardless of configuration.
+    Providers with a high chance of being whitelisted:
+      Yandex.Cloud, Timeweb, VK Cloud, Selectel, Beget, REG.RU
+  * --port must stay 443 (80 also passes). Other ports are dropped.
+  * --dest must be a WHITELISTED domain, e.g.:
+      yastatic.net  storage.yandex.net  userapi.com  vkuser.net
+      vkuservideo.ru  cdnvideo.ru  okcdn.ru  hosting.reg.ru
+  * NEVER use twitter.com / x.com / youtube.com / telegram.org as dest:
+    those SNI values are actively RST'd.
+  * fp=chrome is mandatory (included in the generated URI): the ordinary
+    TSPU still fingerprints TLS on top of the whitelist layer.
+
+Full whitelist data: https://github.com/openlibrecommunity/twl
 HELPEOF
         exit 0
         ;;
@@ -297,51 +331,106 @@ validate_dest() {
     log_info "TCP connect time from server to ${DEST}: ${rtt}s (lower is better; <0.05s ideal)"
   fi
 
-  # The decisive check that most guides omit: does the SNI plausibly belong
-  # near our IP? A censor can passively flag "SNI of a US CDN, IP of a random
-  # VPS in another country" without any active probing.
-  local dest_ip our_net dest_net
-  dest_ip=$(ssh_exec "getent hosts ${DEST} | awk '{print \$1; exit}'" 2>/dev/null | tr -d '\r')
-  if [[ -n "$dest_ip" ]]; then
-    our_net="${SERVER_IP%.*}"
-    dest_net="${dest_ip%.*}"
-    if [[ "$our_net" == "$dest_net" ]]; then
-      log_ok "${DEST} (${dest_ip}) is in the same /24 as your server — ideal disguise"
-    else
-      log_warn "${DEST} resolves to ${dest_ip}, your server is ${SERVER_IP} (different network)."
-      log_warn "Traffic claiming SNI=${DEST} toward an unrelated IP is a passive fingerprint."
-      log_warn "Run with --scan-dest to find TLSv1.3 sites hosted in your server's own subnet."
+  # Under whitelist filtering the SNI must be an ALLOWED domain. Proximity to
+  # our own subnet is irrelevant: the TSPU checks the SNI against its own
+  # allow/deny lists, not against the ownership of the destination IP.
+  local d
+  for d in $DANGEROUS_SNI; do
+    if [[ "$DEST" == "$d" || "$DEST" == *".${d}" ]]; then
+      log_error "${DEST} is an actively blacklisted SNI — the TSPU sends RST for it."
+      log_error "Use a whitelisted domain instead: ${WHITELIST_SNI[*]}"
+      exit 1
     fi
+  done
+
+  local known=0 w
+  for w in "${WHITELIST_SNI[@]}"; do
+    [[ "$DEST" == "$w" || "$DEST" == *".${w}" ]] && known=1
+  done
+  if ((known)); then
+    log_ok "${DEST} is a known whitelisted SNI"
+  else
+    log_warn "${DEST} is not in the built-in whitelisted-SNI list."
+    log_warn "If your clients are behind RU whitelist filtering, prefer: ${WHITELIST_SNI[*]}"
+    log_warn "Check the current data: https://github.com/openlibrecommunity/twl"
+  fi
+}
+
+# ─── Whitelist reachability ──────────────────────────────────────────────────
+# The server's own IP must be inside the operator's allowed CIDR list,
+# otherwise packets to it are dropped at L3 and nothing else matters.
+check_server_whitelisted() {
+  echo -e "\n${BOLD}═══ Whitelist viability of the server IP ═══${NC}"
+
+  # Which AS/organisation owns our IP? Whitelisted space is dominated by
+  # Yandex.Cloud, Timeweb, VK, Selectel, Beget, REG.RU.
+  local org=""
+  if command -v whois &>/dev/null; then
+    org=$(timeout 10 whois "$SERVER_IP" 2>/dev/null \
+      | sed -n 's/^\(org-name\|OrgName\|descr\|netname\):[[:space:]]*//Ip' | head -1)
+  fi
+  if [[ -n "$org" ]]; then
+    log_info "Server IP ${SERVER_IP} belongs to: ${org}"
+    if printf '%s' "$org" | grep -qiE 'yandex|timeweb|vk |vkontakte|mail\.ru|selectel|beget|reg\.ru|rostelecom|ittask'; then
+      log_ok "This is a provider that is commonly present in TSPU whitelists"
+    else
+      log_warn "This provider is not a typical whitelisted one."
+      log_warn "Under RU whitelist filtering, clients may not reach it at all (L3 drop)."
+      log_warn "Consider Yandex.Cloud / Timeweb / VK Cloud / Selectel / Beget / REG.RU."
+    fi
+  else
+    log_info "Install 'whois' locally for an IP ownership hint (brew/apt install whois)"
+  fi
+
+  # Only TCP 80/443/22 survive the port filter.
+  if [[ "$VLESS_PORT" != "443" && "$VLESS_PORT" != "80" ]]; then
+    log_warn "Port ${VLESS_PORT} is unlikely to pass: whitelist filtering allows only TCP 80/443/22."
+    log_warn "Use --port 443 unless you know your operator permits ${VLESS_PORT}."
   fi
 }
 
 # ─── Dest discovery ──────────────────────────────────────────────────────────
-# Scans the server's own /24 for hosts that serve TLSv1.3 and reports the
-# certificate hostname of each. A dest inside your own subnet makes the
-# SNI/IP pairing look natural, which is the property a censor checks passively.
+# Tests the built-in whitelisted SNI candidates for Reality compatibility
+# (TLSv1.3 + X25519 + ALPN h2) from the server, and reports handshake latency.
+# Scanning our own subnet would be pointless here: the TSPU allows or denies an
+# SNI by its own lists, not by whether the domain is hosted near our IP.
 scan_dest_candidates() {
-  local base="${SERVER_IP%.*}"
-  log_info "Scanning ${base}.0/24 for TLSv1.3 hosts (this takes ~1 minute)..."
-  echo -e "${BOLD}Candidates (use one as --dest):${NC}"
+  log_info "Testing whitelisted SNI candidates for Reality compatibility..."
+  printf "\n%-24s %-9s %-8s %-6s %-8s %s\n" "DOMAIN" "TLSv1.3" "X25519" "ALPN" "CONNECT" "VERDICT"
+  printf '%.0s─' {1..76}; echo
 
-  # Run the scan remotely: connectivity from the SERVER is what matters, and
-  # neighbours are one hop away. Parallelised with xargs.
-  ssh_exec "seq 1 254 | xargs -P 40 -I{} sh -c '
-    ip=${base}.{}
-    out=\$(timeout 3 openssl s_client -connect \$ip:443 -tls1_3 -servername \$ip </dev/null 2>/dev/null)
-    echo \"\$out\" | grep -q TLSv1.3 || exit 0
-    cn=\$(echo \"\$out\" | sed -n \"s/^subject=.*CN[ ]*=[ ]*//p\" | head -1)
-    alpn=\$(echo \"\$out\" | sed -n \"s/^ALPN protocol: //p\" | head -1)
-    [ -n \"\$cn\" ] && echo \"  \$ip  CN=\$cn  ALPN=\${alpn:-none}\"
-  ' 2>/dev/null" || log_warn "Scan failed or found nothing"
+  local d out tls x25519 alpn rtt verdict
+  for d in "${WHITELIST_SNI[@]}"; do
+    out=$(ssh_exec "timeout 8 openssl s_client -connect ${d}:443 -servername ${d} -alpn h2 -curves X25519 </dev/null 2>/dev/null" 2>/dev/null)
+    if printf '%s' "$out" | grep -q 'TLSv1.3'; then
+      tls="yes"; x25519="yes"
+    else
+      tls="NO"; x25519="NO"
+    fi
+    alpn=$(printf '%s' "$out" | sed -n 's/^ALPN protocol: //p' | head -1)
+    rtt=$(ssh_exec "timeout 8 curl -sI -o /dev/null -w '%{time_connect}' https://${d}" 2>/dev/null | tr -d '\r')
+
+    if [[ "$tls" == "yes" && "$alpn" == "h2" ]]; then
+      verdict="GOOD"
+    elif [[ "$tls" == "yes" ]]; then
+      verdict="usable (no h2)"
+    else
+      verdict="unsuitable"
+    fi
+    printf "%-24s %-9s %-8s %-6s %-8s %s\n" "$d" "$tls" "$x25519" "${alpn:-none}" "${rtt:-?}" "$verdict"
+  done
 
   cat <<'EOF'
 
-How to pick from the list above:
-  * Prefer a real, well-known site over a hosting panel or a blank default page.
-  * It must be reachable from YOUR network too (test: curl -sI https://<name>).
-  * ALPN=h2 is preferred.
-Then re-run:  vlessreality.sh --ssh-host <IP> --dest <chosen-hostname>
+Pick a GOOD row and re-run with it:
+  vlessreality.sh --ssh-host <IP> --dest <domain>
+
+Notes:
+  * These domains are whitelisted at the TSPU L7 layer, so the SNI passes.
+  * Lower CONNECT time is better: Reality really forwards the handshake to
+    dest, so its latency is added to every client connection.
+  * Whitelists differ per operator and per region. If one domain fails for
+    your clients, try the next. Current data: github.com/openlibrecommunity/twl
 EOF
 }
 
@@ -588,8 +677,13 @@ verify_reachable() {
       log_ok "TCP/${VLESS_PORT} is reachable from this machine"
     else
       log_warn "TCP/${VLESS_PORT} is NOT reachable from this machine."
-      log_warn "Open inbound TCP/${VLESS_PORT} in your provider's panel (Security Group / Cloud Firewall),"
-      log_warn "or the port is filtered upstream — try --port 8443 or another port."
+      log_warn "Open inbound TCP/${VLESS_PORT} in your provider's panel (Security Group / Cloud Firewall)."
+      if [[ "$VLESS_PORT" != "443" && "$VLESS_PORT" != "80" ]]; then
+        log_warn "Also note: whitelist filtering passes only TCP 80/443/22 — retry with --port 443."
+      else
+        log_warn "If TCP/443 itself is dropped, your server IP is not in the operator's whitelist."
+        log_warn "Move to a whitelisted provider (Yandex.Cloud / Timeweb / VK Cloud / Selectel)."
+      fi
       return
     fi
   fi
@@ -690,6 +784,7 @@ main() {
     exit 0
   fi
 
+  check_server_whitelisted
   check_ports
 
   install_xray

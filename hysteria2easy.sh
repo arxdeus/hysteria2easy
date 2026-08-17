@@ -103,6 +103,16 @@ show_banner() {
 ╚════════════════════════════════════════════════════╝
 
 EOF
+  cat <<'WARNEOF'
+  NOTE: Hysteria2 is UDP-only (QUIC). Under Russian TSPU whitelist filtering
+  ("белые списки") nearly all UDP is dropped — only TCP 80/443/22 pass — so
+  Hysteria2 CANNOT work there, no matter how it is configured. Neither obfs
+  nor port hopping helps: the drop happens at L3/port level, before DPI.
+
+  If your clients are behind whitelist filtering, use VLESS + Reality on a
+  whitelisted Russian IP instead:   bash vlessreality.sh --help
+
+WARNEOF
 }
 
 # ─── CLI argument parsing ──────────────────────────────────────────────────────
