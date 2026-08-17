@@ -506,20 +506,45 @@ generate_credentials() {
     exit 1
   fi
 
-  # x25519 keypair. Output format changed across Xray versions:
-  #   older: "Private key: ..." / "Public key: ..."
-  #   newer: "PrivateKey: ..."  / "Password: ..."
+  # x25519 keypair. The label has changed repeatedly across Xray versions:
+  #   v1.8:  "Private key: ..."          / "Public key: ..."
+  #   v1.8+: "PrivateKey: ..."           / "Password: ..."
+  #   v25+:  "PrivateKey: ..."           / "Password (PublicKey): ..."
+  #                                        plus a "Hash32: ..." line
+  # Rather than chase every spelling, match on the KEY part of "label: value"
+  # generically: take the first line whose label mentions "private", and the
+  # first whose label mentions "public" or "password". Hash32 is ignored
+  # because it is neither.
   local keys
   keys=$(ssh_exec "${XRAY_DIR}/xray x25519" | tr -d '\r')
-  PRIVATE_KEY=$(printf '%s\n' "$keys" | sed -n 's/^[Pp]rivate[ ]*[Kk]ey:[[:space:]]*//p' | head -1)
-  PUBLIC_KEY=$(printf '%s\n' "$keys" | sed -n 's/^[Pp]ublic[ ]*[Kk]ey:[[:space:]]*//p' | head -1)
-  [[ -z "$PUBLIC_KEY" ]] && PUBLIC_KEY=$(printf '%s\n' "$keys" | sed -n 's/^[Pp]assword:[[:space:]]*//p' | head -1)
+
+  PRIVATE_KEY=$(printf '%s\n' "$keys" \
+    | awk -F': *' 'tolower($1) ~ /private/ {print $2; exit}')
+  PUBLIC_KEY=$(printf '%s\n' "$keys" \
+    | awk -F': *' 'tolower($1) ~ /public|password/ && tolower($1) !~ /private/ {print $2; exit}')
+
+  # Trim any stray whitespace the split may have left behind
+  PRIVATE_KEY="${PRIVATE_KEY//[[:space:]]/}"
+  PUBLIC_KEY="${PUBLIC_KEY//[[:space:]]/}"
 
   if [[ -z "$PRIVATE_KEY" || -z "$PUBLIC_KEY" ]]; then
     log_error "Failed to parse the x25519 keypair. Raw output:"
     printf '%s\n' "$keys"
+    log_error "Report this output as a bug: the key label format changed again."
     exit 1
   fi
+
+  # Both values are base64url-encoded 32-byte keys: 43 chars, no padding.
+  # Catch a mis-parse here rather than shipping a URI that silently fails.
+  local k
+  for k in "$PRIVATE_KEY" "$PUBLIC_KEY"; do
+    if [[ ! "$k" =~ ^[A-Za-z0-9_-]{43}$ ]]; then
+      log_error "Parsed an implausible x25519 key: '${k}'"
+      log_error "Expected 43 base64url characters. Raw output:"
+      printf '%s\n' "$keys"
+      exit 1
+    fi
+  done
 
   # shortId: 0-8 bytes hex. 8 hex chars is a common, safe choice.
   SHORT_ID=$(ssh_exec "openssl rand -hex 4" | tr -d '\r')
