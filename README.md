@@ -205,3 +205,65 @@ a browser fingerprint is detectable.
 
 v2rayNG, Nekobox, Streisand, Hiddify, sing-box, FoXray. Scan the QR code or
 paste the `vless://` URI. No `insecure` flag is needed.
+
+---
+
+## No whitelisted RU IP? `olcrtceasy.sh` (olcRTC)
+
+VLESS+Reality needs the server to sit on a **whitelisted** IP. If all you have
+is a foreign VPS, [olcRTC](https://github.com/openlibrecommunity/olcrtc) is the
+way out:
+
+```bash
+bash olcrtceasy.sh --ssh-host <IP>
+```
+
+### Why a foreign VPS works here
+
+The client never connects to your server. **Both sides dial out** to a
+whitelisted video-conferencing SFU (Jitsi / Telemost / WB Stream), which relays
+between them:
+
+```
+client --SOCKS5--> olcrtc cnc --> [whitelisted SFU] <-- olcrtc srv --> internet
+```
+
+Your server's IP is never a destination for the client, so it does not need to
+be whitelisted, only ordinary outbound internet. No inbound port is opened at
+all. Traffic is XChaCha20-Poly1305 encrypted and multiplexed over WebRTC
+data/video channels, looking like a normal video call.
+
+The cost is throughput and latency: every byte is smuggled through a video-call
+channel. Prefer `vlessreality.sh` whenever a whitelisted IP is available.
+
+### Provider / transport matrix
+
+| transport | telemost | wbstream | jitsi | speed |
+|---|:--:|:--:|:--:|---|
+| `datachannel` | no | unstable | **yes** | fastest, lowest ping |
+| `vp8channel` | yes | yes | yes | fast, high ping |
+| `seichannel` | no | yes | yes | slow, low ping |
+| `videochannel` | yes | yes | yes | slowest, highest ping |
+
+**Default and recommended: `jitsi + datachannel`.** The script refuses
+combinations that upstream marks as broken, instead of leaving you with a tunnel
+that connects and silently carries nothing (`telemost + datachannel`, or
+`wbstream + datachannel` without `--wb-token`).
+
+### What the script does
+
+Installs Go, builds olcRTC from source, picks a Jitsi instance that responds
+from the server, generates the room and key, writes the config with liveness
+probes plus a 6h session recycle, and runs it under systemd with auto-restart.
+It builds natively rather than via upstream's Podman flow, and adds swap first
+if RAM is under 4GB (the Go build otherwise gets OOM-killed).
+
+Output is an `olcrtc://` URI plus QR code for
+[owenclave](https://github.com/owenewans/owenclave),
+[veil](https://github.com/venterum/veil) or
+[olcbox](https://github.com/alananisimov/olcbox); the native client is
+`./scripts/cnc.sh` from the upstream repo.
+
+**Verify the chosen service is whitelisted in the CLIENT's network** by opening
+the Jitsi host in a browser there. Both sides must run builds with the same wire
+format, so update them together.
