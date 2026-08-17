@@ -76,7 +76,7 @@ check_remote_deps() {
   # psmisc: fuser command (kills processes on ports)
   # socat: needed for acme.sh HTTP-01 challenge
   # Use || true to allow error handling with set -e
-  ssh_exec "apt-get update && apt-get install -y curl openssl socat net-tools psmisc netcat-openbsd" || {
+  ssh_exec "apt-get update && apt-get install -y curl openssl socat net-tools psmisc netcat-openbsd tcpdump" || {
     log_error "Failed to install remote dependencies"
     exit 1
   }
@@ -209,6 +209,12 @@ prompt_server_config() {
 check_ports() {
   log_info "Checking port availability..."
 
+  # Never touch the SSH port — fuser -k on it would kill sshd and lock us out
+  if [[ "$HYSTERIA_PORT" == "$SSH_PORT" ]]; then
+    log_error "Hysteria2 port (${HYSTERIA_PORT}) must differ from the SSH port (${SSH_PORT})."
+    exit 1
+  fi
+
   # Stop existing Hysteria2 if running (re-install scenario)
   ssh_exec "systemctl stop hysteria2 2>/dev/null || true"
   ssh_exec "fuser -k ${HYSTERIA_PORT}/tcp ${HYSTERIA_PORT}/udp 2>/dev/null || true"
@@ -254,33 +260,61 @@ open_firewall() {
     log_ok "firewalld rules added (${HYSTERIA_PORT}/udp, 80/tcp)"
   fi
 
-  # Raw iptables/nft default-deny INPUT policy
-  if ssh_exec "iptables -S INPUT 2>/dev/null | grep -qE '^-P INPUT (DROP|REJECT)'" &>/dev/null; then
+  # Raw iptables whitelist: default-deny policy OR a trailing "reject everything
+  # else" rule (-A INPUT -j DROP/REJECT), which is the common allowlist pattern
+  if ssh_exec "iptables -S INPUT 2>/dev/null | grep -qE '^-P INPUT (DROP|REJECT)|^-A INPUT (-j|.* -j) (DROP|REJECT)'" &>/dev/null; then
     ssh_exec "iptables -C INPUT -p udp --dport ${HYSTERIA_PORT} -j ACCEPT 2>/dev/null || iptables -I INPUT -p udp --dport ${HYSTERIA_PORT} -j ACCEPT"
     ssh_exec "iptables -C INPUT -p tcp --dport 80 -j ACCEPT 2>/dev/null || iptables -I INPUT -p tcp --dport 80 -j ACCEPT"
-    log_ok "iptables ACCEPT rules inserted (default-deny INPUT detected)"
+    # Persist across reboots when the tooling is available
+    ssh_exec "command -v netfilter-persistent >/dev/null && netfilter-persistent save 2>/dev/null || command -v iptables-save >/dev/null && iptables-save > /etc/iptables/rules.v4 2>/dev/null || true"
+    log_ok "iptables ACCEPT rules inserted (whitelist INPUT chain detected)"
   fi
 
   # Show what is actually filtering, for diagnosis
   ssh_exec "iptables -S INPUT 2>/dev/null | head -20 || true"
 }
 
-# Verify UDP reachability from the client side after startup.
+# End-to-end UDP reachability check: capture on the server with tcpdump while
+# sending probes from this machine. This catches provider/cloud whitelist
+# firewalls that local rules cannot open.
 verify_udp_reachable() {
   log_info "Verifying UDP/${HYSTERIA_PORT} reachability from this machine..."
   if ssh_exec "ss -lnup | grep -q ':${HYSTERIA_PORT} '" &>/dev/null; then
     log_ok "Server is listening on UDP/${HYSTERIA_PORT}"
   else
     log_error "Server is NOT listening on UDP/${HYSTERIA_PORT} — check: journalctl -u hysteria2 -n 50"
+    return
   fi
 
-  # A masquerade HTTPS probe over TCP will fail (Hysteria2 is UDP-only), so
-  # probe UDP directly; no reply is normal, ICMP unreachable means blocked.
-  if command -v nc &>/dev/null; then
-    printf 'x' | nc -u -w 2 "${SERVER_IP}" "${HYSTERIA_PORT}" &>/dev/null && \
-      log_ok "UDP packet sent to ${SERVER_IP}:${HYSTERIA_PORT} without ICMP rejection" || \
-      log_warn "UDP probe to ${SERVER_IP}:${HYSTERIA_PORT} was rejected — likely blocked by a cloud/provider firewall whitelist. Add an inbound rule for UDP ${HYSTERIA_PORT} in the provider panel."
+  if ! ssh_exec "command -v tcpdump >/dev/null" &>/dev/null; then
+    log_warn "tcpdump not available on server — skipping end-to-end UDP check"
+    return
   fi
+
+  local cap
+  cap=$(mktemp)
+  ssh_exec "timeout 8 tcpdump -c 1 -n -l udp dst port ${HYSTERIA_PORT} 2>/dev/null" > "$cap" &
+  local cap_pid=$!
+  sleep 2
+  # Send a few probes (nc if present, else bash /dev/udp)
+  local i
+  for i in 1 2 3; do
+    if command -v nc &>/dev/null; then
+      printf 'probe' | nc -u -w 1 "${SERVER_IP}" "${HYSTERIA_PORT}" &>/dev/null || true
+    else
+      (echo probe > "/dev/udp/${SERVER_IP}/${HYSTERIA_PORT}") 2>/dev/null || true
+    fi
+    sleep 1
+  done
+  wait "$cap_pid" 2>/dev/null || true
+
+  if grep -q "\.${HYSTERIA_PORT}" "$cap"; then
+    log_ok "UDP/${HYSTERIA_PORT} is reachable end-to-end — probe packet arrived at the server"
+  else
+    log_warn "UDP probe did NOT reach the server. A provider/cloud firewall whitelist is blocking it."
+    log_warn "Add an inbound rule for UDP ${HYSTERIA_PORT} in the provider panel (Security Group / Cloud Firewall)."
+  fi
+  rm -f "$cap"
 }
 
 check_root() {
@@ -308,15 +342,26 @@ detect_arch() {
 
 get_latest_hysteria_version() {
   # Tag format: app/v2.x.y — must return the FULL tag for download URL
-  # [^"]* stops at the closing quote; trailing .* consumes the comma and rest of line
-  curl -s https://api.github.com/repos/${HYSTERIA_REPO}/releases/latest \
-    | grep '"tag_name"' | sed 's/.*"tag_name": "\([^"]*\)".*/\1/'
+  local tag
+  tag=$(curl -s "https://api.github.com/repos/${HYSTERIA_REPO}/releases/latest" \
+    | grep '"tag_name"' | sed 's/.*"tag_name": "\([^"]*\)".*/\1/')
+  # GitHub API is rate-limited (60/hour per IP) — fall back to the redirect of
+  # /releases/latest, which is not rate-limited
+  if [[ -z "$tag" ]]; then
+    tag=$(curl -sI "https://github.com/${HYSTERIA_REPO}/releases/latest" \
+      | tr -d '\r' | sed -n 's|^[Ll]ocation:.*/releases/tag/||p' | sed 's|%2F|/|g')
+  fi
+  echo "$tag"
 }
 
 install_hysteria_binary() {
   local arch tag url status
   arch=$(detect_arch)
   tag=$(get_latest_hysteria_version)
+  if [[ -z "$tag" ]]; then
+    log_error "Could not determine the latest Hysteria2 version (GitHub unreachable or rate-limited)."
+    exit 1
+  fi
 
   # Tag format is: app/v2.x.y — use full tag in download URL
   url="https://github.com/${HYSTERIA_REPO}/releases/download/${tag}/hysteria-linux-${arch}"
@@ -343,12 +388,15 @@ install_hysteria_binary() {
 create_server_config() {
   local domain yaml_password
   domain="${SERVER_IP}.nip.io"
-  # Escape double quotes for YAML string value: " → \"
-  yaml_password="${AUTH_PASSWORD//\"/\\\"}"
+  # Escape for a YAML double-quoted scalar: \ → \\ first, then " → \"
+  yaml_password="${AUTH_PASSWORD//\\/\\\\}"
+  yaml_password="${yaml_password//\"/\\\"}"
 
   log_info "Creating Hysteria2 config..."
   # NOTE: Hysteria2 v2 YAML — 'listen' is at ROOT level (NOT under 'server:')
-  ssh_exec "cat > ${HYSTERIA_DIR}/config.yaml << EOF
+  # Content is piped via stdin with a QUOTED local heredoc, so the remote shell
+  # never re-parses it: $, backticks etc. in the password cannot be injected.
+  ssh_exec "cat > ${HYSTERIA_DIR}/config.yaml" <<REMOTEEOF || { log_error "Failed to write config.yaml"; exit 1; }
 listen: :${HYSTERIA_PORT}
 
 tls:
@@ -357,14 +405,14 @@ tls:
 
 auth:
   type: password
-  password: \"${yaml_password}\"
+  password: "${yaml_password}"
 
 masquerade:
   type: proxy
   proxy:
     url: https://${SNI}
     rewriteHost: true
-EOF"
+REMOTEEOF
   log_ok "Config written to ${HYSTERIA_DIR}/config.yaml"
 }
 
@@ -372,8 +420,9 @@ EOF"
 setup_systemd() {
   local svc="/etc/systemd/system/hysteria2.service"
   log_info "Setting up systemd service..."
-  # NOTE: heredoc is unquoted so ${HYSTERIA_DIR} and ${HYSTERIA_PORT} expand on the remote
-  ssh_exec "cat > ${svc} << EOF
+  # Variables expand locally; content is piped via stdin so the remote shell
+  # does not re-parse it
+  ssh_exec "cat > ${svc}" <<REMOTEEOF || { log_error "Failed to write systemd unit"; exit 1; }
 [Unit]
 Description=Hysteria2 Server
 After=network.target
@@ -387,7 +436,7 @@ LimitNOFILE=65536
 
 [Install]
 WantedBy=multi-user.target
-EOF"
+REMOTEEOF
   ssh_exec "systemctl daemon-reload"
   ssh_exec "systemctl enable hysteria2"
   log_ok "Systemd service enabled"
@@ -397,14 +446,31 @@ EOF"
 install_acme_sh() {
   log_info "Installing acme.sh..."
   # Download first, then run — avoids < /dev/null killing the pipe
-  ssh_exec "curl -fsSL https://get.acme.sh -o /tmp/install-acme.sh"
-  ssh_exec "sh /tmp/install-acme.sh email=admin@${SERVER_IP}.nip.io < /dev/null"
+  ssh_exec "curl -fsSL https://get.acme.sh -o /tmp/install-acme.sh" || return 1
+  ssh_exec "sh /tmp/install-acme.sh email=admin@${SERVER_IP}.nip.io < /dev/null" || return 1
   # Verify installation
   ssh_exec "test -f ~/.acme.sh/acme.sh" || {
-    log_error "acme.sh installation failed — ~/.acme.sh/acme.sh not found"
-    exit 1
+    log_warn "acme.sh installation failed — ~/.acme.sh/acme.sh not found"
+    return 1
   }
   log_ok "acme.sh installed"
+}
+
+# Self-signed fallback. The client URI already uses insecure=1 + pinSHA256, so
+# a self-signed certificate is functionally identical to a Let's Encrypt one.
+# This is essential for whitelist firewalls where inbound TCP/80 is blocked
+# and HTTP-01 validation can never succeed.
+generate_self_signed_cert() {
+  local domain="${SERVER_IP}.nip.io"
+  local dir="${CERT_DIR}/${domain}_ecc"
+  log_warn "Using a self-signed certificate (works identically: client pins the cert by SHA256)"
+  ssh_exec "mkdir -p '${dir}' && openssl req -x509 -nodes -newkey ec -pkeyopt ec_paramgen_curve:prime256v1 \
+    -keyout '${dir}/${domain}.key' -out '${dir}/fullchain.cer' \
+    -subj '/CN=${domain}' -days 3650" || {
+    log_error "Failed to generate self-signed certificate"
+    exit 1
+  }
+  log_ok "Self-signed certificate generated for ${domain}"
 }
 
 issue_certificate() {
@@ -418,8 +484,14 @@ issue_certificate() {
   # Use Let's Encrypt (ZeroSSL default requires EAB registration which often fails)
   ssh_exec "~/.acme.sh/acme.sh --set-default-ca --server letsencrypt"
 
-  # HTTP-01 standalone challenge — acme.sh starts its own server on port 80
-  ssh_exec "~/.acme.sh/acme.sh --issue -d ${domain} --standalone --httpport 80 --force"
+  # HTTP-01 standalone challenge — acme.sh starts its own server on port 80.
+  # This REQUIRES inbound TCP/80 from the internet; under a provider whitelist
+  # firewall it will fail, so fall back to a self-signed cert.
+  if ! ssh_exec "~/.acme.sh/acme.sh --issue -d ${domain} --standalone --httpport 80 --force"; then
+    log_warn "ACME HTTP-01 failed. Inbound TCP/80 is likely blocked (whitelist firewall) or the nip.io Let's Encrypt rate limit was hit."
+    generate_self_signed_cert
+    return 0
+  fi
 
   # Install cert to Hysteria2 paths
   # reloadcmd uses "|| true" because hysteria2 service may not exist yet during first setup;
@@ -428,14 +500,16 @@ issue_certificate() {
     --key-file '${CERT_DIR}/${domain}_ecc/${domain}.key' \
     --fullchain-file '${CERT_DIR}/${domain}_ecc/fullchain.cer' \
     --reloadcmd 'systemctl restart hysteria2 || true'"
+  log_ok "Certificate issued for ${domain}"
+}
 
-  # Verify cert was created
+verify_certificate() {
+  local domain="${SERVER_IP}.nip.io"
   local cert_path="${CERT_DIR}/${domain}_ecc/fullchain.cer"
   ssh_exec "[[ -f ${cert_path} ]]" || {
     log_error "Certificate not found: ${cert_path}"
     exit 1
   }
-  log_ok "Certificate issued for ${domain}"
 }
 
 get_cert_fingerprint() {
@@ -449,13 +523,15 @@ get_cert_fingerprint() {
 
 # ─── URI generation ──────────────────────────────────────────────────────────
 generate_uri() {
-  local fp domain uri encoded_pass
+  local fp domain uri encoded_pass encoded_remark
   domain="${SERVER_IP}.nip.io"
   fp=$(get_cert_fingerprint)
   # URL-encode only chars that break URI parsing: @ : # ? %
   encoded_pass=$(printf '%s' "$AUTH_PASSWORD" | sed 's/%/%25/g; s/@/%40/g; s/:/%3A/g; s/#/%23/g; s/?/%3F/g')
+  # Fragment: encode %, # and spaces so remarks like "My Server #1" stay valid
+  encoded_remark=$(printf '%s' "$REMARK" | sed 's/%/%25/g; s/#/%23/g; s/ /%20/g')
   # hysteria2:// URI format (note: /? not just ?)
-  uri="hysteria2://${encoded_pass}@${SERVER_IP}:${HYSTERIA_PORT}/?sni=${domain}&insecure=1&pinSHA256=${fp}#${REMARK}"
+  uri="hysteria2://${encoded_pass}@${SERVER_IP}:${HYSTERIA_PORT}/?sni=${domain}&insecure=1&pinSHA256=${fp}#${encoded_remark}"
   echo "$uri"
 }
 
@@ -529,8 +605,13 @@ main() {
   log_info "Server IP: ${SERVER_IP}"
 
   install_hysteria_binary
-  install_acme_sh
-  issue_certificate
+  if install_acme_sh; then
+    issue_certificate
+  else
+    log_warn "Skipping ACME (installation failed) — outbound access may be restricted too."
+    generate_self_signed_cert
+  fi
+  verify_certificate
   create_server_config
   setup_systemd
   start_hysteria
