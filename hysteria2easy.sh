@@ -13,6 +13,11 @@ CERT_DIR="/root/.acme.sh"
 SSH_HOST="" SSH_PORT="22" SSH_USER="root" SSH_PASSWORD=""
 SERVER_IP="" HYSTERIA_PORT="443" AUTH_PASSWORD="" REMARK="Hysteria2"
 SNI="web.max.ru"
+# Salamander obfuscation: wraps QUIC so the handshake is not recognizable as
+# QUIC/TLS by DPI. Empty = disabled. Auto-generated when --obfs auto.
+OBFS_PASSWORD=""
+# UDP port range for port hopping, e.g. "20000-50000". Empty = disabled.
+PORT_HOPPING=""
 
 # ─── Color output ───────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -140,6 +145,14 @@ parse_args() {
         SNI="$2"
         shift 2
         ;;
+      --obfs)
+        OBFS_PASSWORD="$2"
+        shift 2
+        ;;
+      --port-hopping)
+        PORT_HOPPING="$2"
+        shift 2
+        ;;
       --help | -h)
         cat <<'HELPEOF'
 Usage: hysteria2easy.sh [OPTIONS]
@@ -153,6 +166,10 @@ Usage: hysteria2easy.sh [OPTIONS]
   --remark REMARK       Connection remark [Hysteria2]
   --ip IP              Server public IP [auto-detected]
   --sni SNI            SNI/hostname to masquerade as [web.max.ru]
+  --obfs PASS          Salamander obfuscation password ('auto' = random).
+                       Hides the QUIC handshake from DPI. Must match on client.
+  --port-hopping RANGE UDP port range, e.g. 20000-50000. Traffic rotates across
+                       ports to survive per-port throttling/blocking.
   --help, -h           Show this help
 HELPEOF
         exit 0
@@ -386,11 +403,25 @@ install_hysteria_binary() {
 
 # ─── Server configuration ────────────────────────────────────────────────────
 create_server_config() {
-  local domain yaml_password
+  local domain yaml_password obfs_block=""
   domain="${SERVER_IP}.nip.io"
   # Escape for a YAML double-quoted scalar: \ → \\ first, then " → \"
   yaml_password="${AUTH_PASSWORD//\\/\\\\}"
   yaml_password="${yaml_password//\"/\\\"}"
+
+  # Salamander obfuscation makes the QUIC handshake unrecognizable to DPI.
+  # Without it, a censor can fingerprint the QUIC Initial packet and drop it
+  # even when the port is reachable.
+  if [[ -n "$OBFS_PASSWORD" ]]; then
+    local yaml_obfs="${OBFS_PASSWORD//\\/\\\\}"
+    yaml_obfs="${yaml_obfs//\"/\\\"}"
+    obfs_block="
+obfs:
+  type: salamander
+  salamander:
+    password: \"${yaml_obfs}\"
+"
+  fi
 
   log_info "Creating Hysteria2 config..."
   # NOTE: Hysteria2 v2 YAML — 'listen' is at ROOT level (NOT under 'server:')
@@ -398,7 +429,7 @@ create_server_config() {
   # never re-parses it: $, backticks etc. in the password cannot be injected.
   ssh_exec "cat > ${HYSTERIA_DIR}/config.yaml" <<REMOTEEOF || { log_error "Failed to write config.yaml"; exit 1; }
 listen: :${HYSTERIA_PORT}
-
+${obfs_block}
 tls:
   cert: ${CERT_DIR}/${domain}_ecc/fullchain.cer
   key: ${CERT_DIR}/${domain}_ecc/${domain}.key
@@ -414,6 +445,74 @@ masquerade:
     rewriteHost: true
 REMOTEEOF
   log_ok "Config written to ${HYSTERIA_DIR}/config.yaml"
+  [[ -n "$OBFS_PASSWORD" ]] && log_ok "Salamander obfuscation enabled"
+}
+
+# ─── Port hopping ────────────────────────────────────────────────────────────
+# Redirects a whole UDP port range to the listening port. The client rotates
+# source/destination ports, which defeats per-port blocking and QoS throttling
+# that targets a single well-known port.
+setup_port_hopping() {
+  [[ -z "$PORT_HOPPING" ]] && return 0
+
+  if [[ ! "$PORT_HOPPING" =~ ^[0-9]+-[0-9]+$ ]]; then
+    log_error "Invalid --port-hopping range: '${PORT_HOPPING}' (expected e.g. 20000-50000)"
+    exit 1
+  fi
+  local lo="${PORT_HOPPING%-*}" hi="${PORT_HOPPING#*-}"
+  if ((lo >= hi)) || ((hi > 65535)) || ((lo < 1024)); then
+    log_error "Invalid range ${PORT_HOPPING}: need 1024 <= low < high <= 65535"
+    exit 1
+  fi
+  # Guard: an SSH port inside the redirected range would break remote access
+  if ((SSH_PORT >= lo && SSH_PORT <= hi)); then
+    log_error "SSH port ${SSH_PORT} falls inside the hopping range ${PORT_HOPPING}. Choose a different range."
+    exit 1
+  fi
+
+  log_info "Setting up UDP port hopping ${lo}-${hi} → ${HYSTERIA_PORT}..."
+  ssh_exec "iptables -t nat -C PREROUTING -p udp --dport ${lo}:${hi} -j DNAT --to-destination :${HYSTERIA_PORT} 2>/dev/null || \
+    iptables -t nat -A PREROUTING -p udp --dport ${lo}:${hi} -j DNAT --to-destination :${HYSTERIA_PORT}" || {
+    log_warn "Failed to add DNAT rule — port hopping disabled"
+    PORT_HOPPING=""
+    return 0
+  }
+  # Allow the range through a whitelist firewall as well
+  ssh_exec "command -v ufw >/dev/null && ufw status | grep -q '^Status: active' && ufw allow ${lo}:${hi}/udp >/dev/null 2>&1 || true"
+  ssh_exec "command -v netfilter-persistent >/dev/null && netfilter-persistent save 2>/dev/null || iptables-save > /etc/iptables/rules.v4 2>/dev/null || true"
+  log_ok "Port hopping active: UDP ${lo}-${hi} → ${HYSTERIA_PORT}"
+}
+
+# ─── Censorship diagnostics ──────────────────────────────────────────────────
+# Distinguishes the failure modes people hit under IP-whitelist regimes, where
+# only approved destinations are reachable and everything else is dropped.
+diagnose_censorship() {
+  echo -e "\n${BOLD}═══ Reachability diagnosis (client → server) ═══${NC}"
+
+  # 1. TCP to the SSH port works by definition (we are connected), so the IP
+  #    itself is routable. If UDP fails while TCP works, UDP/QUIC is filtered.
+  log_ok "TCP to ${SERVER_IP}:${SSH_PORT} works (SSH is connected) — the IP is routable"
+
+  # 2. Is TCP/443 to the server reachable? Tells us whether TCP-based
+  #    fallbacks (VLESS/Reality, WireGuard-over-TCP, shadowsocks) are viable.
+  if command -v nc &>/dev/null; then
+    if nc -z -w 5 "${SERVER_IP}" 443 &>/dev/null; then
+      log_ok "TCP/443 to the server is reachable"
+    else
+      log_warn "TCP/443 is not reachable (nothing listens there yet, or it is filtered)"
+    fi
+  fi
+
+  # 3. Can we reach ANY external QUIC service? If public QUIC is dead too, the
+  #    network blocks UDP/443 wholesale rather than targeting this server.
+  if command -v curl &>/dev/null; then
+    if curl --http3-only -s -o /dev/null --max-time 8 https://www.google.com 2>/dev/null; then
+      log_ok "Outbound QUIC/HTTP3 works on this network"
+    else
+      log_warn "Outbound QUIC/HTTP3 to public sites fails → this network blocks or throttles UDP/443 generally."
+      log_warn "Hysteria2 is UDP-only, so it cannot work here. Use a TCP-based protocol (VLESS+Reality, Shadowsocks, WireGuard-over-TCP)."
+    fi
+  fi
 }
 
 # ─── Systemd service ─────────────────────────────────────────────────────────
@@ -523,15 +622,30 @@ get_cert_fingerprint() {
 
 # ─── URI generation ──────────────────────────────────────────────────────────
 generate_uri() {
-  local fp domain uri encoded_pass encoded_remark
+  local fp domain uri encoded_pass encoded_remark hostport obfs_params=""
   domain="${SERVER_IP}.nip.io"
   fp=$(get_cert_fingerprint)
   # URL-encode only chars that break URI parsing: @ : # ? %
   encoded_pass=$(printf '%s' "$AUTH_PASSWORD" | sed 's/%/%25/g; s/@/%40/g; s/:/%3A/g; s/#/%23/g; s/?/%3F/g')
   # Fragment: encode %, # and spaces so remarks like "My Server #1" stay valid
   encoded_remark=$(printf '%s' "$REMARK" | sed 's/%/%25/g; s/#/%23/g; s/ /%20/g')
+
+  # With port hopping the client must be told the range: host:port,range
+  if [[ -n "$PORT_HOPPING" ]]; then
+    hostport="${SERVER_IP}:${HYSTERIA_PORT},${PORT_HOPPING}"
+  else
+    hostport="${SERVER_IP}:${HYSTERIA_PORT}"
+  fi
+
+  # obfs must match the server or the client cannot complete a handshake
+  if [[ -n "$OBFS_PASSWORD" ]]; then
+    local encoded_obfs
+    encoded_obfs=$(printf '%s' "$OBFS_PASSWORD" | sed 's/%/%25/g; s/&/%26/g; s/#/%23/g; s/?/%3F/g; s/ /%20/g')
+    obfs_params="&obfs=salamander&obfs-password=${encoded_obfs}"
+  fi
+
   # hysteria2:// URI format (note: /? not just ?)
-  uri="hysteria2://${encoded_pass}@${SERVER_IP}:${HYSTERIA_PORT}/?sni=${domain}&insecure=1&pinSHA256=${fp}#${encoded_remark}"
+  uri="hysteria2://${encoded_pass}@${hostport}/?sni=${domain}&insecure=1&pinSHA256=${fp}${obfs_params}#${encoded_remark}"
   echo "$uri"
 }
 
@@ -557,6 +671,8 @@ show_summary() {
   Server IP:    ${SERVER_IP}
   Domain:       ${domain}
   Port:         ${HYSTERIA_PORT}
+  Port hopping: ${PORT_HOPPING:-disabled}
+  Obfuscation:  $([[ -n "$OBFS_PASSWORD" ]] && echo "salamander (enabled)" || echo "disabled")
   Auth:         [hidden]
 
   hysteria2:// URI:
@@ -599,6 +715,13 @@ main() {
   check_remote_deps
   check_root
   prompt_server_config
+
+  # 'auto' generates a random obfs password
+  if [[ "$OBFS_PASSWORD" == "auto" ]]; then
+    OBFS_PASSWORD=$(head -c 24 /dev/urandom | base64 | tr -d '/+=' | head -c 24)
+    log_info "Generated random obfs password"
+  fi
+
   check_ports
   open_firewall
 
@@ -614,8 +737,10 @@ main() {
   verify_certificate
   create_server_config
   setup_systemd
+  setup_port_hopping
   start_hysteria
   verify_udp_reachable
+  diagnose_censorship
 
   local uri
   uri=$(generate_uri)
