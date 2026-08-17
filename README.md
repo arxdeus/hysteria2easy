@@ -157,12 +157,30 @@ exactly like a mirror of that site.
 
 ### Choosing `--dest`
 
-Must support TLSv1.3, HTTP/2 and X25519, and must be **reachable from the
-client network** (a disguise pointing at a blocked site is itself a signal).
-The script validates all of this before writing the config.
+This is the single most important decision, and the popular tutorial answers
+(`www.microsoft.com`, `www.icloud.com`) are among the weakest.
 
-Good candidates: `www.microsoft.com`, `www.icloud.com`, `dl.google.com`,
-`www.samsung.com`. Prefer a site hosted in the same country as your server.
+Reality hides the *content* of your traffic, but not the relationship between
+the SNI you claim and the IP you send it to. A connection announcing
+`SNI=www.microsoft.com` toward a random VPS in another country is an anomaly
+detectable **passively, from a single packet** — no active probing required.
+
+Strength, best to worst:
+
+1. **A real site in your server's own subnet.** The SNI then matches the
+   network that owns your IP, so the pairing looks natural. Discover them:
+   ```bash
+   bash vlessreality.sh --ssh-host <IP> --scan-dest
+   ```
+2. A site hosted in the same **country** as your server.
+3. A widely-contacted CDN/software endpoint that is essentially never blocked
+   (`cdn.jsdelivr.net`, `swcdn.apple.com`, `dl.google.com`) — the default.
+4. **Avoid:** the most-copied tutorial dests, and anything blocked in the
+   *client's* network (a disguise pointing at a blocked site is itself a flag).
+
+Requirements, all checked automatically before the config is written:
+TLSv1.3, HTTP/2, X25519, no redirect away from the hostname, low RTT from the
+server (the handshake is really forwarded, so dest latency is added to yours).
 
 ### Clients
 

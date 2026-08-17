@@ -19,8 +19,15 @@ SSH_HOST="" SSH_PORT="22" SSH_USER="root" SSH_PASSWORD=""
 SERVER_IP="" VLESS_PORT="443" REMARK="VLESS-Reality"
 # The site whose TLS handshake we borrow. MUST support TLSv1.3 + HTTP/2 and
 # should be a host that is not blocked in the client's network.
-DEST="www.microsoft.com"
+#
+# There is no universally good default: the strongest dest is one hosted NEAR
+# your server (same datacenter/subnet), so that the SNI matches the IP's owner.
+# Use --scan-dest to discover those. This default is only a reasonable
+# starting point: a CDN-hosted software endpoint, which is rarely blocked and
+# plausibly contacted by any machine (OS/software updates).
+DEST="cdn.jsdelivr.net"
 UUID="" PRIVATE_KEY="" PUBLIC_KEY="" SHORT_ID=""
+SCAN_DEST=0
 
 # ─── Color output ───────────────────────────────────────────────────────────────
 RED='\033[0;31m'
@@ -100,6 +107,10 @@ parse_args() {
         DEST="$2"
         shift 2
         ;;
+      --scan-dest)
+        SCAN_DEST=1
+        shift
+        ;;
       --uuid)
         UUID="$2"
         shift 2
@@ -122,17 +133,25 @@ Usage: vlessreality.sh [OPTIONS]
   --ssh-password PASS   SSH password [prompted]
   --port PORT           VLESS listening port [443]
   --dest HOST           Site to borrow the TLS handshake from
-                        [www.microsoft.com]. Must support TLSv1.3 + HTTP/2
+                        [cdn.jsdelivr.net]. Must support TLSv1.3 + HTTP/2
                         and must NOT be blocked in your network.
+  --scan-dest           Scan the server's own /24 for TLSv1.3 hosts and print
+                        candidates, then exit. A dest in your server's subnet
+                        makes the SNI/IP pairing look natural to passive DPI.
   --uuid UUID           Client UUID [auto-generated]
   --remark REMARK       Connection remark [VLESS-Reality]
   --ip IP               Server public IP [defaults to --ssh-host]
   --help, -h            Show this help
 
-Good --dest candidates (allowed in most restrictive networks):
-  www.microsoft.com  www.icloud.com  dl.google.com  www.samsung.com
-Pick one that is reachable from the CLIENT network, and ideally hosted
-in the same country as your server.
+Choosing --dest, in order of strength:
+  1. BEST: a real site hosted in your server's own subnet (use --scan-dest).
+     The SNI then matches the network that owns your IP.
+  2. GOOD: a site hosted in the same COUNTRY as your server.
+  3. OK:   a widely-contacted CDN/software endpoint that is never blocked,
+           e.g. cdn.jsdelivr.net, swcdn.apple.com, dl.google.com
+  4. AVOID: the most-copied tutorial dests (www.microsoft.com, www.icloud.com)
+     and any site blocked in the CLIENT's network.
+Requirements: TLSv1.3, HTTP/2, X25519, no redirect away, low RTT from server.
 HELPEOF
         exit 0
         ;;
@@ -259,6 +278,71 @@ validate_dest() {
   else
     log_warn "${DEST} may not support X25519 — consider another dest if clients fail."
   fi
+
+  # No redirect to a different domain: a dest that 301s elsewhere means the
+  # "site" we impersonate does not actually serve content on this hostname.
+  local code
+  code=$(ssh_exec "timeout 10 curl -sI -o /dev/null -w '%{http_code}' https://${DEST}" 2>/dev/null | tr -d '\r')
+  if [[ "$code" =~ ^(301|302|307|308)$ ]]; then
+    log_warn "${DEST} answers HTTP ${code} (redirect). A site that redirects away is a weaker disguise."
+  elif [[ "$code" == "200" ]]; then
+    log_ok "${DEST} answers HTTP 200 directly"
+  fi
+
+  # Latency matters: the TLS handshake is really forwarded to dest, so its RTT
+  # is added to every client connection.
+  local rtt
+  rtt=$(ssh_exec "timeout 10 curl -sI -o /dev/null -w '%{time_connect}' https://${DEST}" 2>/dev/null | tr -d '\r')
+  if [[ -n "$rtt" ]]; then
+    log_info "TCP connect time from server to ${DEST}: ${rtt}s (lower is better; <0.05s ideal)"
+  fi
+
+  # The decisive check that most guides omit: does the SNI plausibly belong
+  # near our IP? A censor can passively flag "SNI of a US CDN, IP of a random
+  # VPS in another country" without any active probing.
+  local dest_ip our_net dest_net
+  dest_ip=$(ssh_exec "getent hosts ${DEST} | awk '{print \$1; exit}'" 2>/dev/null | tr -d '\r')
+  if [[ -n "$dest_ip" ]]; then
+    our_net="${SERVER_IP%.*}"
+    dest_net="${dest_ip%.*}"
+    if [[ "$our_net" == "$dest_net" ]]; then
+      log_ok "${DEST} (${dest_ip}) is in the same /24 as your server — ideal disguise"
+    else
+      log_warn "${DEST} resolves to ${dest_ip}, your server is ${SERVER_IP} (different network)."
+      log_warn "Traffic claiming SNI=${DEST} toward an unrelated IP is a passive fingerprint."
+      log_warn "Run with --scan-dest to find TLSv1.3 sites hosted in your server's own subnet."
+    fi
+  fi
+}
+
+# ─── Dest discovery ──────────────────────────────────────────────────────────
+# Scans the server's own /24 for hosts that serve TLSv1.3 and reports the
+# certificate hostname of each. A dest inside your own subnet makes the
+# SNI/IP pairing look natural, which is the property a censor checks passively.
+scan_dest_candidates() {
+  local base="${SERVER_IP%.*}"
+  log_info "Scanning ${base}.0/24 for TLSv1.3 hosts (this takes ~1 minute)..."
+  echo -e "${BOLD}Candidates (use one as --dest):${NC}"
+
+  # Run the scan remotely: connectivity from the SERVER is what matters, and
+  # neighbours are one hop away. Parallelised with xargs.
+  ssh_exec "seq 1 254 | xargs -P 40 -I{} sh -c '
+    ip=${base}.{}
+    out=\$(timeout 3 openssl s_client -connect \$ip:443 -tls1_3 -servername \$ip </dev/null 2>/dev/null)
+    echo \"\$out\" | grep -q TLSv1.3 || exit 0
+    cn=\$(echo \"\$out\" | sed -n \"s/^subject=.*CN[ ]*=[ ]*//p\" | head -1)
+    alpn=\$(echo \"\$out\" | sed -n \"s/^ALPN protocol: //p\" | head -1)
+    [ -n \"\$cn\" ] && echo \"  \$ip  CN=\$cn  ALPN=\${alpn:-none}\"
+  ' 2>/dev/null" || log_warn "Scan failed or found nothing"
+
+  cat <<'EOF'
+
+How to pick from the list above:
+  * Prefer a real, well-known site over a hosting panel or a blank default page.
+  * It must be reachable from YOUR network too (test: curl -sI https://<name>).
+  * ALPN=h2 is preferred.
+Then re-run:  vlessreality.sh --ssh-host <IP> --dest <chosen-hostname>
+EOF
 }
 
 # ─── Xray installation ───────────────────────────────────────────────────────
@@ -600,6 +684,12 @@ main() {
   check_remote_deps
   check_root
   prompt_server_config
+
+  if ((SCAN_DEST)); then
+    scan_dest_candidates
+    exit 0
+  fi
+
   check_ports
 
   install_xray
