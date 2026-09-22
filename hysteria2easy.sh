@@ -6,6 +6,8 @@
 
 VERSION="1.0.0"
 HYSTERIA_REPO="apernet/hysteria"
+# Used only if GitHub cannot be queried for the latest release tag
+HYSTERIA_FALLBACK_TAG="app/v2.12.3"
 HYSTERIA_DIR="/etc/hysteria2"
 CERT_DIR="/root/.acme.sh"
 
@@ -370,24 +372,55 @@ detect_arch() {
 get_latest_hysteria_version() {
   # Tag format: app/v2.x.y — must return the FULL tag for download URL
   local tag
-  tag=$(curl -s "https://api.github.com/repos/${HYSTERIA_REPO}/releases/latest" \
-    | grep '"tag_name"' | sed 's/.*"tag_name": "\([^"]*\)".*/\1/')
-  # GitHub API is rate-limited (60/hour per IP) — fall back to the redirect of
-  # /releases/latest, which is not rate-limited
+  # 1) GitHub API (rate-limited to 60/hour per IP). Tolerate any spacing in JSON.
+  tag=$(curl -fsSL --max-time 15 \
+    -H 'Accept: application/vnd.github+json' \
+    "https://api.github.com/repos/${HYSTERIA_REPO}/releases/latest" 2>/dev/null \
+    | tr ',' '\n' | sed -n 's/.*"tag_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' | head -n1)
+  tag=$(printf '%s' "$tag" | tr -d '[:space:]')
+
+  # 2) Fall back to the redirect of /releases/latest (not rate-limited).
   if [[ -z "$tag" ]]; then
-    tag=$(curl -sI "https://github.com/${HYSTERIA_REPO}/releases/latest" \
-      | tr -d '\r' | sed -n 's|^[Ll]ocation:.*/releases/tag/||p' | sed 's|%2F|/|g')
+    tag=$(curl -sIL --max-time 15 "https://github.com/${HYSTERIA_REPO}/releases/latest" \
+      | tr -d '\r' | sed -n 's|.*/releases/tag/||p' | head -n1 | sed 's|%2F|/|g')
+    tag=$(printf '%s' "$tag" | tr -d '[:space:]')
   fi
-  echo "$tag"
+
+  # 3) Fall back to the tag list on the releases atom feed.
+  if [[ -z "$tag" ]]; then
+    tag=$(curl -fsSL --max-time 15 "https://github.com/${HYSTERIA_REPO}/releases.atom" 2>/dev/null \
+      | sed -n 's|.*/releases/tag/\([^"<]*\).*|\1|p' | head -n1 | sed 's|%2F|/|g')
+    tag=$(printf '%s' "$tag" | tr -d '[:space:]')
+  fi
+
+  # Only accept a plausible app/vX.Y.Z (or vX.Y.Z) tag
+  if [[ ! "$tag" =~ ^(app/)?v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]]; then
+    return 1
+  fi
+  printf '%s' "$tag"
+}
+
+# Same lookup, but executed on the remote server (useful when the local machine
+# has no GitHub access or is API rate-limited)
+get_latest_hysteria_version_remote() {
+  local tag
+  tag=$(ssh_exec "curl -sIL --max-time 15 'https://github.com/${HYSTERIA_REPO}/releases/latest' | tr -d '\r' | sed -n 's|.*/releases/tag/||p' | head -n1" 2>/dev/null || true)
+  tag=$(printf '%s' "$tag" | tr -d '[:space:]' | sed 's|%2F|/|g')
+  [[ "$tag" =~ ^(app/)?v[0-9]+\.[0-9]+(\.[0-9]+)?$ ]] || return 1
+  printf '%s' "$tag"
 }
 
 install_hysteria_binary() {
   local arch tag url status
   arch=$(detect_arch)
-  tag=$(get_latest_hysteria_version)
+  tag=$(get_latest_hysteria_version || true)
   if [[ -z "$tag" ]]; then
-    log_error "Could not determine the latest Hysteria2 version (GitHub unreachable or rate-limited)."
-    exit 1
+    tag=$(get_latest_hysteria_version_remote || true)
+  fi
+  if [[ -z "$tag" ]]; then
+    log_warn "Could not determine the latest Hysteria2 version (GitHub unreachable or rate-limited)."
+    tag="$HYSTERIA_FALLBACK_TAG"
+    log_warn "Falling back to pinned version ${tag}"
   fi
 
   # Tag format is: app/v2.x.y — use full tag in download URL
@@ -398,6 +431,22 @@ install_hysteria_binary() {
 
   # Verify URL is reachable before downloading (-L follows GitHub's 302 redirect to CDN)
   status=$(ssh_exec "curl -o /dev/null -sLw '%{http_code}' '${url}'")
+  # Some tags are published without the app/ prefix — retry the other form
+  if [[ "$status" != "200" ]]; then
+    local alt_tag alt_url
+    if [[ "$tag" == app/* ]]; then alt_tag="${tag#app/}"; else alt_tag="app/${tag}"; fi
+    alt_url="https://github.com/${HYSTERIA_REPO}/releases/download/${alt_tag}/hysteria-linux-${arch}"
+    if [[ "$(ssh_exec "curl -o /dev/null -sLw '%{http_code}' '${alt_url}'")" == "200" ]]; then
+      tag="$alt_tag"; url="$alt_url"; status="200"
+    fi
+  fi
+  # Last resort: the pinned known-good release
+  if [[ "$status" != "200" && "$tag" != "$HYSTERIA_FALLBACK_TAG" ]]; then
+    log_warn "Release ${tag} not downloadable (HTTP ${status}); trying pinned ${HYSTERIA_FALLBACK_TAG}"
+    tag="$HYSTERIA_FALLBACK_TAG"
+    url="https://github.com/${HYSTERIA_REPO}/releases/download/${tag}/hysteria-linux-${arch}"
+    status=$(ssh_exec "curl -o /dev/null -sLw '%{http_code}' '${url}'")
+  fi
   if [[ "$status" != "200" ]]; then
     log_error "Failed to download Hysteria2: HTTP ${status}"
     log_error "URL: ${url}"
